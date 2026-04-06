@@ -22,7 +22,7 @@
 1. 대시보드 → **SQL Editor**
 2. 사용하는 모드에 맞게 실행:
    - **레거시 JSON 적재:** `schema.sql` → `crawl_rows`
-   - **회원 목록 적재:** `schema_members_crawled.sql` → `members_crawled` + `insert_members_crawled_batch` RPC (`seq` 유니크, 중복 삽입은 무시)
+   - **회원 목록 적재:** `schema_members_crawled.sql` → `members_crawled` + `insert_members_crawled_batch` RPC (`seq` 유니크, 중복 삽입은 무시) + **`member_crawl_progress`** (Edge가 다음에 읽을 목록 `page` 저장)
 
 3. **Project Settings → API**에서 URL·키를 복사해 둡니다.  
    - **Edge `member-crawl`:** 함수 Secrets에 `SUPABASE_SERVICE_ROLE_KEY`(RPC용) 저장. `SUPABASE_URL` / `SUPABASE_ANON_KEY`는 Edge 런타임에 자동 주입되는 경우가 많습니다.  
@@ -123,7 +123,8 @@ python -m crawler.probe
 
 워크플로: `.github/workflows/crawl.yml`
 
-- **역할:** 5분마다 `curl`로 `member-crawl` Edge Function에 `POST`만 보냅니다. (Python 러너 없음)
+- **역할:** 3분마다 `curl`로 `member-crawl` Edge Function에 `POST`만 보냅니다. (Python 러너 없음)  
+  한 번의 호출은 기본 **목록 1페이지만** 크롤·저장하고, DB `member_crawl_progress.next_page`에 이어서 읽을 페이지를 둡니다. 다음 스케줄/수동 실행이 **3페이지부터** 이어갑니다.
 - **Repository Secrets (2개):**
   | Secret | 설명 |
   |--------|------|
@@ -148,6 +149,7 @@ python -m crawler.probe
 | `CRAWL_FETCH_MEMO` | `true` / `false` |
 | `CRAWL_MEMO_DELAY_MS` | 기본 `0` |
 | `CRAWL_MAX_LIST_PAGES` | 기본 `2000` |
+| `CRAWL_PAGES_PER_RUN` | 기본 `1` — 호출 한 번에 연속으로 처리할 목록 페이지 수 (예: `2`면 5·6페이지를 한 번에) |
 | `CRAWL_MEMBER_FORM_PATH` | 기본 `/admin/member/member_form.html` |
 | `CRAWL_MEMBER_FORM_EXTRA_QUERY` | 목록과 맞춘 쿼리 스트링 |
 | `SUPABASE_SERVICE_ROLE_KEY` | RPC `insert_members_crawled_batch` 호출용 (또는 `ETK_SERVICE_ROLE_KEY`) |
@@ -158,7 +160,9 @@ python -m crawler.probe
 
 배포 예: `supabase functions deploy member-crawl --no-verify-jwt`
 
-**주의:** Edge 함수는 **실행 시간 제한**이 있습니다. 페이지·메모 요청이 매우 많으면 타임아웃 날 수 있음 → 그때는 `CRAWL_FETCH_MEMO=false` 로 줄이거나, 로컬에서 `python -m crawler.run`(`.env`)로 돌리는 방식을 병행하세요.
+**주의:** Edge 함수는 **실행 시간 제한**이 있습니다. 페이지 단위로 나눈 뒤에도 메모 요청이 많으면 `CRAWL_PAGES_PER_RUN=1` 유지·`CRAWL_FETCH_MEMO=false`·`CRAWL_MEMO_DELAY_MS` 조정을 검토하세요. 전체 일괄은 로컬 `python -m crawler.run`(`.env`)와 병행할 수 있습니다.
+
+**요청 JSON (선택):** `{"page_count":2}` — 시크릿 기본보다 우선. `{"reset":true}` — 다음 시작을 1페이지로 맞춤. `{"start_page":10}` — 체크포인트 무시하고 10페이지부터 (성공 시에도 `next_page`는 갱신됨).
 
 ---
 

@@ -2,7 +2,7 @@ name: Member crawl (Edge)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/3 * * * *"
   workflow_dispatch:
 
 env:
@@ -17,11 +17,12 @@ jobs:
         run: |
           set -e
           echo "member-crawl 호출…"
+          # 한 호출당 목록 페이지 수: Edge 시크릿 CRAWL_PAGES_PER_RUN (기본 1) 또는 본문 page_count
           response=$(curl -sS -w "%{http_code}" -X POST \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json" \
-            -d '{"automated":true}' \
+            -d '{"automated":true,"page_count":1}' \
             "https://${{ secrets.SUPABASE_PROJECT_REF }}.supabase.co/functions/v1/member-crawl")
           http_code="${response: -3}"
           body="${response%???}"

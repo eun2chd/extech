@@ -62,3 +62,18 @@ end;
 $$;
 
 grant execute on function public.insert_members_crawled_batch(jsonb) to service_role;
+
+-- Edge member-crawl: 호출마다 N페이지만 처리하고 다음 시작 페이지를 기억
+create table if not exists public.member_crawl_progress (
+  id text primary key,
+  next_page integer not null default 1 check (next_page >= 1),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.member_crawl_progress enable row level security;
+
+insert into public.member_crawl_progress (id, next_page)
+values ('member_list', 1)
+on conflict (id) do nothing;
+
+grant select, insert, update on public.member_crawl_progress to service_role;

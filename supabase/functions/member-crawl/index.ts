@@ -14,7 +14,15 @@
  *     CRAWL_LOGIN_USER_FIELD (기본 m_id), CRAWL_LOGIN_PASS_FIELD (기본 m_pass)
  *     CRAWL_TABLE_SELECTOR (기본 table.list_table)
  *     CRAWL_FETCH_MEMO (true/false), CRAWL_MEMO_DELAY_MS, CRAWL_MAX_LIST_PAGES
+ *     CRAWL_PAGES_PER_RUN (기본 1) — 한 번에 목록 몇 페이지까지 처리할지
  *     CRAWL_MEMBER_FORM_PATH, CRAWL_MEMBER_FORM_EXTRA_QUERY
+ *
+ *   요청 JSON (선택)
+ *     page_count — 이번 호출에서 처리할 목록 페이지 수 (시크릿 기본값보다 우선)
+ *     reset: true — 진행을 1페이지부터 다시 (DB next_page 를 1로 맞춤)
+ *     start_page — 다음 페이지 대신 이 번호부터 처리 (체크포인트 읽기 무시)
+ *
+ *   진행 저장: public.member_crawl_progress (id=member_list, next_page)
  *   DB (RPC)
  *     SUPABASE_SERVICE_ROLE_KEY (또는 ETK_SERVICE_ROLE_KEY)
  *   호출 인증 (둘 중 하나)
@@ -82,6 +90,8 @@ function parseTable(html: string, selector: string): Record<string, string>[] {
     seen.set(h, n + 1);
     headers.push(n === 0 ? h : `${h}_${n + 1}`);
   });
+  console.log("[member-crawl] parseTable headers (index:key):");
+  headers.forEach((h, idx) => console.log(`[member-crawl]   [${idx}] ${h}`));
 
   const out: Record<string, string>[] = [];
   const dataRows = rows.toArray().slice(1);
@@ -185,6 +195,119 @@ function cookieHeader(jar: Map<string, string>): string {
   return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
+/** 디버그: 객체의 모든 키·값 로그 (민감값은 마스크) */
+function logKeyValues(
+  label: string,
+  obj: Record<string, unknown>,
+  secretKeys?: ReadonlySet<string>,
+) {
+  const secrets = secretKeys ?? new Set<string>();
+  for (const [k, v] of Object.entries(obj)) {
+    if (secrets.has(k)) {
+      const s = typeof v === "string" ? v : String(v);
+      console.log(`[member-crawl] ${label} ${k}=`, s ? `<redacted len=${s.length}>` : "");
+      continue;
+    }
+    console.log(`[member-crawl] ${label} ${k}=`, v);
+  }
+}
+
+function serviceRestHeaders(serviceKey: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${serviceKey}`,
+    apikey: serviceKey,
+  };
+}
+
+async function fetchProgressNextPage(
+  supabaseUrl: string,
+  serviceKey: string,
+): Promise<number> {
+  const base = supabaseUrl.replace(/\/$/, "");
+  const url =
+    `${base}/rest/v1/member_crawl_progress?select=next_page&id=eq.member_list`;
+  const r = await fetch(url, { headers: serviceRestHeaders(serviceKey) });
+  const text = await r.text();
+  if (!r.ok) {
+    console.error("[member-crawl] progress GET failed", r.status, text.slice(0, 400));
+    throw new Error(`member_crawl_progress GET HTTP ${r.status}`);
+  }
+  let arr: unknown;
+  try {
+    arr = JSON.parse(text);
+  } catch {
+    throw new Error("member_crawl_progress GET: invalid JSON");
+  }
+  if (!Array.isArray(arr) || arr.length === 0) return 1;
+  const raw = (arr[0] as { next_page?: unknown }).next_page;
+  const page = typeof raw === "number" && Number.isFinite(raw)
+    ? Math.floor(raw)
+    : parseInt(String(raw ?? ""), 10);
+  if (Number.isNaN(page) || page < 1) return 1;
+  return page;
+}
+
+async function patchProgressNextPage(
+  supabaseUrl: string,
+  serviceKey: string,
+  nextPage: number,
+): Promise<void> {
+  const n = Math.max(1, Math.floor(nextPage));
+  const base = supabaseUrl.replace(/\/$/, "");
+  const url = `${base}/rest/v1/member_crawl_progress?id=eq.member_list`;
+  const r = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      ...serviceRestHeaders(serviceKey),
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({ next_page: n }),
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    console.error("[member-crawl] progress PATCH failed", r.status, t.slice(0, 400));
+    throw new Error(`member_crawl_progress PATCH HTTP ${r.status}`);
+  }
+}
+
+/** 테이블만 있고 seed 행이 없을 때 PATCH 가 무반응이 되는 것을 막음 */
+async function ensureProgressRow(
+  supabaseUrl: string,
+  serviceKey: string,
+): Promise<void> {
+  const base = supabaseUrl.replace(/\/$/, "");
+  const url =
+    `${base}/rest/v1/member_crawl_progress?select=id&id=eq.member_list`;
+  const r = await fetch(url, { headers: serviceRestHeaders(serviceKey) });
+  const text = await r.text();
+  if (!r.ok) {
+    console.error("[member-crawl] progress ensure GET", r.status, text.slice(0, 300));
+    throw new Error(`member_crawl_progress ensure GET HTTP ${r.status}`);
+  }
+  let arr: unknown;
+  try {
+    arr = JSON.parse(text) as unknown;
+  } catch {
+    throw new Error("member_crawl_progress ensure: invalid JSON");
+  }
+  if (Array.isArray(arr) && arr.length > 0) return;
+  const ins = await fetch(`${base}/rest/v1/member_crawl_progress`, {
+    method: "POST",
+    headers: {
+      ...serviceRestHeaders(serviceKey),
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({ id: "member_list", next_page: 1 }),
+  });
+  if (!ins.ok && ins.status !== 409) {
+    const t = await ins.text();
+    console.error("[member-crawl] progress ensure POST", ins.status, t.slice(0, 300));
+    throw new Error(`member_crawl_progress ensure POST HTTP ${ins.status}`);
+  }
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -201,13 +324,24 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    let bodyJson: Record<string, unknown> = {};
+    try {
+      const raw = await req.text();
+      if (raw.trim()) {
+        const j = JSON.parse(raw) as unknown;
+        if (j && typeof j === "object" && !Array.isArray(j)) {
+          bodyJson = j as Record<string, unknown>;
+        }
+      }
+    } catch {
+      bodyJson = {};
+    }
+
     const anon = (
-      Deno.env.get("SUPABASE_ANON_KEY") ||
       Deno.env.get("ETK_ANON_KEY") ||
       ""
     ).trim();
     const serviceRole = (
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ||
       Deno.env.get("ETK_SERVICE_ROLE_KEY") ||
       ""
     ).trim();
@@ -219,6 +353,15 @@ Deno.serve(async (req: Request) => {
       (!apikeyHeader || apikeyHeader === anon);
     const okService = !!serviceRole && token === serviceRole &&
       apikeyHeader === serviceRole;
+
+    console.log("[member-crawl] request auth:", {
+      method: req.method,
+      hasAuthorization: !!auth,
+      tokenLen: token.length,
+      apikeyHeaderLen: apikeyHeader.length,
+      okAnon,
+      okService,
+    });
 
     if (!okAnon && !okService) {
       return new Response(
@@ -254,6 +397,10 @@ Deno.serve(async (req: Request) => {
       1,
       parseInt(Deno.env.get("CRAWL_MAX_LIST_PAGES") ?? "2000", 10) || 2000,
     );
+    const pagesPerRunDefault = Math.max(
+      1,
+      parseInt(Deno.env.get("CRAWL_PAGES_PER_RUN") ?? "1", 10) || 1,
+    );
     const formPath = (Deno.env.get("CRAWL_MEMBER_FORM_PATH") ??
       "/admin/member/member_form.html").trim();
     const formExtra = (Deno.env.get("CRAWL_MEMBER_FORM_EXTRA_QUERY") ??
@@ -264,6 +411,28 @@ Deno.serve(async (req: Request) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ||
       Deno.env.get("ETK_SERVICE_ROLE_KEY") ||
       "";
+
+    logKeyValues(
+      "config",
+      {
+        CRAWL_BASE_URL: baseUrl,
+        CRAWL_LOGIN_PATH: loginPath,
+        CRAWL_ADMIN_USER: adminUser,
+        CRAWL_ADMIN_PASSWORD: adminPass,
+        CRAWL_LOGIN_USER_FIELD: userField,
+        CRAWL_LOGIN_PASS_FIELD: passField,
+        CRAWL_TABLE_SELECTOR: tableSel,
+        CRAWL_FETCH_MEMO: fetchMemo,
+        CRAWL_MEMO_DELAY_MS: memoDelay,
+        CRAWL_MAX_LIST_PAGES: maxPages,
+        CRAWL_PAGES_PER_RUN: pagesPerRunDefault,
+        CRAWL_MEMBER_FORM_PATH: formPath,
+        CRAWL_MEMBER_FORM_EXTRA_QUERY: formExtra,
+        SUPABASE_URL: supabaseUrl,
+        SUPABASE_SERVICE_ROLE_KEY: serviceKey,
+      },
+      new Set(["CRAWL_ADMIN_PASSWORD", "SUPABASE_SERVICE_ROLE_KEY"]),
+    );
 
     if (!baseUrl || !loginPath || !adminUser || !adminPass) {
       return new Response(
@@ -290,6 +459,23 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    try {
+      await ensureProgressRow(supabaseUrl, serviceKey);
+    } catch (e) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error:
+            "member_crawl_progress 준비 실패 (테이블·권한·schema_members_crawled.sql 확인)",
+          detail: String(e),
+        }),
+        {
+          status: 502,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
+      );
+    }
+
     const jar = new Map<string, string>();
     const ua =
       "Mozilla/5.0 (compatible; MemberCrawl-Edge/1.0; +supabase-edge)";
@@ -298,6 +484,14 @@ Deno.serve(async (req: Request) => {
     const body = new URLSearchParams();
     body.set(userField, adminUser);
     body.set(passField, adminPass);
+    console.log("[member-crawl] login POST", { loginUrl });
+    for (const [k, v] of body.entries()) {
+      const secret = k === passField;
+      console.log(
+        `[member-crawl] login body ${k}=`,
+        secret ? (v ? `<redacted len=${v.length}>` : "") : v,
+      );
+    }
 
     let loginRes = await fetch(loginUrl, {
       method: "POST",
@@ -326,13 +520,88 @@ Deno.serve(async (req: Request) => {
       });
       await applySetCookie(loginRes, jar);
     }
+    console.log("[member-crawl] cookie jar after login:");
+    for (const [k, v] of jar.entries()) {
+      console.log(
+        `[member-crawl]   cookie ${k}=`,
+        v ? `<value len=${v.length}>` : "",
+      );
+    }
+
+    const pagesPerRunCap = 50;
+    const pagesPerRunFromBody =
+      typeof bodyJson.page_count === "number" &&
+        Number.isFinite(bodyJson.page_count)
+        ? Math.floor(bodyJson.page_count)
+        : null;
+    const pagesPerRun = Math.min(
+      pagesPerRunCap,
+      Math.max(
+        1,
+        pagesPerRunFromBody ?? pagesPerRunDefault,
+      ),
+    );
+    const resetCheckpoint = bodyJson.reset === true;
+    const explicitStart =
+      typeof bodyJson.start_page === "number" &&
+        Number.isFinite(bodyJson.start_page)
+        ? Math.max(1, Math.floor(bodyJson.start_page))
+        : null;
+
+    if (resetCheckpoint) {
+      await patchProgressNextPage(supabaseUrl, serviceKey, 1);
+    }
+
+    let startPage: number;
+    if (explicitStart != null) {
+      startPage = explicitStart;
+    } else {
+      try {
+        startPage = await fetchProgressNextPage(supabaseUrl, serviceKey);
+      } catch (e) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: "member_crawl_progress 조회 실패 (schema_members_crawled.sql 반영 여부 확인)",
+            detail: String(e),
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          },
+        );
+      }
+    }
+
+    startPage = Math.max(1, Math.min(startPage, maxPages));
+
+    console.log("[member-crawl] chunk run", {
+      pagesPerRun,
+      startPage,
+      resetCheckpoint,
+      explicitStart,
+    });
 
     let totalInserted = 0;
-    let pages = 0;
+    let pagesProcessed = 0;
+    const processedPageNumbers: number[] = [];
+    let crawlDone = false;
+    let lastPageHandled: number | null = null;
 
-    for (let page = 1; page <= maxPages; page++) {
+    for (let i = 0; i < pagesPerRun; i++) {
+      const page = startPage + i;
+      if (page > maxPages) {
+        console.log(
+          "[member-crawl] page exceeds CRAWL_MAX_LIST_PAGES",
+          page,
+          maxPages,
+        );
+        break;
+      }
+
       const path = listPathForPage(MEMBER_LIST_PATH, page);
       const listUrl = resolveUrl(baseUrl, path);
+      console.log("[member-crawl] list fetch", { page, path, listUrl });
       const listRes = await fetch(listUrl, {
         headers: {
           Cookie: cookieHeader(jar),
@@ -349,6 +618,7 @@ Deno.serve(async (req: Request) => {
           JSON.stringify({
             success: false,
             error: `목록 요청 실패 HTTP ${listRes.status}`,
+            page,
           }),
           {
             status: 502,
@@ -363,7 +633,7 @@ Deno.serve(async (req: Request) => {
       } catch (e) {
         console.error("parseTable", e);
         return new Response(
-          JSON.stringify({ success: false, error: String(e) }),
+          JSON.stringify({ success: false, error: String(e), page }),
           {
             status: 500,
             headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -372,17 +642,38 @@ Deno.serve(async (req: Request) => {
       }
 
       if (!rows.length) {
-        console.log("empty page", page, "stop");
+        console.log("empty page", page, "checkpoint → next_page=1");
+        try {
+          await patchProgressNextPage(supabaseUrl, serviceKey, 1);
+        } catch (e) {
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: "member_crawl_progress 갱신 실패 (빈 목록 후)",
+              detail: String(e),
+            }),
+            {
+              status: 502,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            },
+          );
+        }
+        crawlDone = true;
+        lastPageHandled = page;
         break;
       }
 
       const payloads: Record<string, unknown>[] = [];
 
-      for (let i = 0; i < rows.length; i++) {
-        const row = rows[i]!;
+      for (let ri = 0; ri < rows.length; ri++) {
+        const row = rows[ri]!;
+        console.log(`[member-crawl] page=${page} row=${ri} keys:`);
+        for (const [k, v] of Object.entries(row)) {
+          console.log(`[member-crawl]   ${k}=`, JSON.stringify(v));
+        }
         let memo = "";
         if (fetchMemo && row._seq) {
-          if (i > 0 && memoDelay > 0) {
+          if (ri > 0 && memoDelay > 0) {
             await new Promise((r) => setTimeout(r, memoDelay));
           }
           const q = `mode=modify&seq=${encodeURIComponent(row._seq)}${
@@ -406,7 +697,13 @@ Deno.serve(async (req: Request) => {
           }
         }
         const p = rowToPayload(row, memo);
-        if (p) payloads.push(p);
+        if (p) {
+          console.log(`[member-crawl] page=${page} row=${ri} payload keys:`);
+          for (const [k, v] of Object.entries(p)) {
+            console.log(`[member-crawl]   ${k}=`, v);
+          }
+          payloads.push(p);
+        }
       }
 
       if (payloads.length) {
@@ -431,6 +728,7 @@ Deno.serve(async (req: Request) => {
               error: "RPC insert_members_crawled_batch 실패",
               status: rpcRes.status,
               body: rpcText.slice(0, 1500),
+              page,
             }),
             {
               status: 502,
@@ -444,24 +742,71 @@ Deno.serve(async (req: Request) => {
         } catch {
           n = parseInt(rpcText.trim(), 10);
         }
+        console.log("[member-crawl] RPC batch result", {
+          ok: rpcRes.ok,
+          status: rpcRes.status,
+          parsedCount: n,
+          bodyPreview: rpcText.slice(0, 200),
+        });
         if (typeof n === "number" && !Number.isNaN(n)) totalInserted += n;
+      } else if (rows.length) {
+        console.warn(
+          "[member-crawl] no valid payloads but table had rows; advancing page",
+          page,
+        );
       }
 
-      pages++;
       const last = pageHasNumOne(rows);
-      if (last) {
-        console.log("last page (번호=1) at page", page);
+      const hitMaxPagesCap = page >= maxPages;
+      const nextCheckpoint = last || hitMaxPagesCap ? 1 : page + 1;
+      try {
+        await patchProgressNextPage(supabaseUrl, serviceKey, nextCheckpoint);
+      } catch (e) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: "member_crawl_progress 갱신 실패",
+            detail: String(e),
+            page,
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          },
+        );
+      }
+
+      pagesProcessed++;
+      processedPageNumbers.push(page);
+      lastPageHandled = page;
+
+      if (last || hitMaxPagesCap) {
+        if (last) console.log("last page (번호=1) at page", page);
+        else {
+          console.log("[member-crawl] CRAWL_MAX_LIST_PAGES 도달, checkpoint → 1", page);
+        }
+        crawlDone = true;
         break;
       }
     }
 
+    const nextPageAfterRun = crawlDone
+      ? 1
+      : (lastPageHandled != null ? lastPageHandled + 1 : startPage);
+
     return new Response(
       JSON.stringify({
         success: true,
-        pages,
+        pages_processed: pagesProcessed,
+        pages: processedPageNumbers,
+        start_page: processedPageNumbers[0] ?? startPage,
+        end_page: lastPageHandled,
+        next_page: nextPageAfterRun,
+        crawl_done: crawlDone,
         inserted_approx: totalInserted,
+        pages_per_run: pagesPerRun,
         message:
-          "inserted_approx 는 RPC 가 반환한 신규 행 수 합(문자열 파싱)",
+          "호출마다 pages_per_run 만큼만 목록을 처리하고 member_crawl_progress.next_page 에 이어서 할 페이지를 저장함. inserted_approx 는 RPC 신규 행 수 합.",
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
