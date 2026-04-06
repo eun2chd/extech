@@ -23,6 +23,7 @@
 2. 사용하는 모드에 맞게 실행:
    - **레거시 JSON 적재:** `schema.sql` → `crawl_rows`
    - **회원 목록 적재:** `schema_members_crawled.sql` → `members_crawled` + `insert_members_crawled_batch` RPC (`seq` 유니크, 중복 삽입은 무시) + **`member_crawl_progress`** (Edge가 다음에 읽을 목록 `page` 저장)
+   - **교육·신청자 (Edge `edu-crawl`):** `public.edu` / `public.edu_applicant` 테이블을 **먼저** 만들어 둔 뒤 `schema_edu_crawl.sql` 실행 → **`edu_list_crawl_progress`**, **`edu_applicant_crawl_progress`**, `upsert_edu_batch`, `upsert_edu_applicant_batch` (진행 테이블은 `member_crawl_progress`와 **별도**)
 
 3. **Project Settings → API**에서 URL·키를 복사해 둡니다.  
    - **Edge `member-crawl`:** 함수 Secrets에 `SUPABASE_SERVICE_ROLE_KEY`(RPC용) 저장. `SUPABASE_URL` / `SUPABASE_ANON_KEY`는 Edge 런타임에 자동 주입되는 경우가 많습니다.  
@@ -164,6 +165,36 @@ python -m crawler.probe
 
 **요청 JSON (선택):** `{"page_count":2}` — 시크릿 기본보다 우선. `{"reset":true}` — 다음 시작을 1페이지로 맞춤. `{"start_page":10}` — 체크포인트 무시하고 10페이지부터 (성공 시에도 `next_page`는 갱신됨).
 
+### 4.2 Edge `edu-crawl` (교육 목록 + 신청자)
+
+워크플로: `.github/workflows/crawl-edu.yml` — 3분마다 **같은 job 안에서** `edu_list` 1회 POST 후 `applicants` 1회 POST (각각 `page_count: 1` 기본).
+
+| 단계 | `mode` | 저장 | 진행 테이블 |
+|------|--------|------|-------------|
+| 교육 목록 | `edu_list` | `upsert_edu_batch` (`seq` 기준 upsert) | `edu_list_crawl_progress` (`id=edu_list`, `next_page`) |
+| 신청자 | `applicants` | `upsert_edu_applicant_batch` (`edu_id`,`user_id` upsert) | `edu_applicant_crawl_progress` (`target_edu_seq`, `next_page`) |
+
+**Edge 시크릿 (로그인은 `member-crawl`과 동일 `CRAWL_*` 재사용 가능):**
+
+| 이름 | 설명 |
+|------|------|
+| `EDU_LIST_PATH` | (선택) 미설정 시 ex-tech 기본: `/admin/edu/edu_list.html?select_key=&input_key=&search=&page=1` — `page`만 크롤러가 치환 |
+| `EDU_APPLY_LIST_TEMPLATE` | (선택) 기본: `/admin/edu/edu_apply_list.html?el_seq={el_seq}` — **`el_seq` = `edu.seq`**(목록 체크박스 value와 동일). `{seq}`는 `{el_seq}` 별칭. 템플릿에 **`{page}`가 없으면** 한 번만 요청 후 다음 교육으로 진행(단일 페이지 목록) |
+| `EDU_TABLE_SELECTOR` | 교육 표 선택자 (기본 `table.list_table`) |
+| `EDU_APPLICANT_TABLE_SELECTOR` | 신청자 표 선택자 (기본 `table.list_table`) |
+| `EDU_PAGES_PER_RUN` | 기본 `1` |
+| `EDU_MAX_LIST_PAGES` | 기본 `2000` |
+
+**ex-tech 예시 URL:** 교육 목록 `http://www.ex-techkorea.com/admin/edu/edu_list.html?select_key=&input_key=&search=&page=134` — 신청자 `http://www.ex-techkorea.com/admin/edu/edu_apply_list.html?el_seq=2195` (`el_seq`는 해당 행의 교육 `seq`).
+
+**요청 JSON:** `{"mode":"edu_list"|"applicants","page_count":1,"reset":true}` — `edu_list`만 `start_page` 지원.
+
+마지막 페이지 판별은 회원 크롤과 동일하게 표에 **`번호` 열 값 `1`** 이 있으면 해당 목록의 마지막 페이지로 간주하고, 교육 목록은 `next_page=1`로 돌아갑니다. 신청자는 `{page}`가 있는 다중 페이지면 동일 규칙으로 다음 페이지, **없으면** 한 번 저장 후 해당 `edu_seq` 다음 교육(없으면 처음 `seq`)으로 넘깁니다.
+
+HTML 컬럼명이 다르면 `supabase/functions/edu-crawl/index.ts`의 `rowToEduPayload` / `rowToApplicantPayload` 에서 키 후보를 맞추면 됩니다.
+
+배포 예: `supabase functions deploy edu-crawl --no-verify-jwt`
+
 ---
 
 ## 5. 사이트 쪽에서 미리 확인할 것 (체크리스트)
@@ -216,7 +247,10 @@ crawler/
   run.py             # 진입점
 schema.sql
 schema_members_crawled.sql
+schema_edu_crawl.sql
 requirements.txt
 .github/workflows/crawl.yml
+.github/workflows/crawl-edu.yml
 supabase/functions/member-crawl/
+supabase/functions/edu-crawl/
 ```

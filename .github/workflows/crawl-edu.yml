@@ -1,0 +1,44 @@
+name: Edu crawl (Edge)
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  edu-list-then-applicants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Invoke edu-crawl (교육 목록)
+        run: |
+          set -e
+          response=$(curl -sS -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{"mode":"edu_list","page_count":1}' \
+            "https://${{ secrets.SUPABASE_PROJECT_REF }}.supabase.co/functions/v1/edu-crawl")
+          http_code="${response: -3}"
+          body="${response%???}"
+          echo "HTTP: $http_code"
+          echo "Body: $body"
+          test "$http_code" -eq 200
+
+      - name: Invoke edu-crawl (신청자 목록)
+        run: |
+          set -e
+          response=$(curl -sS -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{"mode":"applicants","page_count":1}' \
+            "https://${{ secrets.SUPABASE_PROJECT_REF }}.supabase.co/functions/v1/edu-crawl")
+          http_code="${response: -3}"
+          body="${response%???}"
+          echo "HTTP: $http_code"
+          echo "Body: $body"
+          test "$http_code" -eq 200
