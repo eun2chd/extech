@@ -5,7 +5,7 @@
 - **기본 모드:** `crawl_rows` JSON upsert (`SAVE_TO_MEMBERS_CRAWLED=false`)
 - **회원 풀패스 모드:** `SAVE_TO_MEMBERS_CRAWLED=true` — `page=1,2,…` 로 목록을 순회하다 **`번호` 열이 `1`인 행이 보이는 페이지**에서 멈추고, `members_crawled`에 RPC 배치 삽입(`seq` 유니크 중복은 무시). 다음 실행은 다시 1페이지부터 반복.
 
-주기 실행은 **GitHub Actions** `cron`(기본 5분) 또는 **Supabase Edge Function**으로 GitHub `workflow_dispatch`를 호출하는 방식을 쓸 수 있습니다.
+**운영 스케줄(권장):** GitHub Actions는 **`SUPABASE_ANON_KEY` + `SUPABASE_PROJECT_REF` 두 개만** Secrets에 두고, `member-crawl` **Edge Function**에 관리자·크롤 URL·`service_role` 등을 넣습니다. (생일 지급 워크플로와 같은 패턴.)
 
 ---
 
@@ -24,8 +24,9 @@
    - **레거시 JSON 적재:** `schema.sql` → `crawl_rows`
    - **회원 목록 적재:** `schema_members_crawled.sql` → `members_crawled` + `insert_members_crawled_batch` RPC (`seq` 유니크, 중복 삽입은 무시)
 
-3. **Project Settings → API**에서 `Project URL`, **`service_role` API 키**를 복사해 둡니다.  
-   크롤러/GitHub Actions는 **`service_role`** 을 사용하는 것을 전제로 합니다. 키는 외부에 노출하지 마세요.
+3. **Project Settings → API**에서 URL·키를 복사해 둡니다.  
+   - **Edge `member-crawl`:** 함수 Secrets에 `SUPABASE_SERVICE_ROLE_KEY`(RPC용) 저장. `SUPABASE_URL` / `SUPABASE_ANON_KEY`는 Edge 런타임에 자동 주입되는 경우가 많습니다.  
+   - **로컬 Python:** `.env`에 `service_role` 사용 시 동일하게 취급합니다.
 
 ---
 
@@ -118,57 +119,42 @@ python -m crawler.probe
 
 ---
 
-## 4. GitHub Actions로 주기 실행
+## 4. GitHub Actions → Edge `member-crawl` (운영 권장)
 
-워크플로 파일: `.github/workflows/crawl.yml`
+워크플로: `.github/workflows/crawl.yml`
 
-- **스케줄:** `*/5 * * * *` (5분마다, 부하 시 지연 가능)
-- **타임아웃:** 90분 (페이지·메모 요청이 많을 수 있음)
-- **수동 실행:** Actions 탭 → `crawl-admin-list` → **Run workflow**
+- **역할:** 5분마다 `curl`로 `member-crawl` Edge Function에 `POST`만 보냅니다. (Python 러너 없음)
+- **Repository Secrets (딱 2개):**
+  | Secret | 설명 |
+  |--------|------|
+  | `SUPABASE_ANON_KEY` | 프로젝트 anon 키 (`Authorization: Bearer` 로 전달) |
+  | `SUPABASE_PROJECT_REF` | 프로젝트 ref만 (예: `abcdxyz` — URL의 `https://abcdxyz.supabase.co` 앞부분) |
 
-회원 풀패스를 쓰려면 Secrets에 `SAVE_TO_MEMBERS_CRAWLED=true`, `SKIP_SUPABASE=false` 를 넣고, Supabase에 `schema_members_crawled.sql`을 적용한 뒤 실행합니다.
+### 4.1 Edge Function `member-crawl` 시크릿
 
-### 4.1 Repository secrets 등록
+대시보드 **Edge Functions → member-crawl → Secrets** (또는 CLI)에 예시:
 
-저장소 **Settings → Secrets and variables → Actions → New repository secret** 에서 아래 이름으로 등록합니다. (워크플로의 `env:`와 이름이 일치해야 합니다.)
+| 이름 | 설명 |
+|------|------|
+| `CRAWL_BASE_URL` | 예: `http://www.ex-techkorea.com/admin` |
+| `CRAWL_LOGIN_PATH` | 예: `/admin/login/login_proc.php` |
+| (회원 목록 URL) | **`member-crawl` 코드에 상수로 고정** (`MEMBER_LIST_PATH`). 다른 사이트면 코드 수정 |
+| `CRAWL_ADMIN_USER` / `CRAWL_ADMIN_PASSWORD` | 관리자 계정 |
+| `CRAWL_LOGIN_USER_FIELD` | 기본 `m_id` |
+| `CRAWL_LOGIN_PASS_FIELD` | 기본 `m_pass` |
+| `CRAWL_TABLE_SELECTOR` | 기본 `table.list_table` |
+| `CRAWL_FETCH_MEMO` | `true` / `false` |
+| `CRAWL_MEMO_DELAY_MS` | 기본 `0` |
+| `CRAWL_MAX_LIST_PAGES` | 기본 `2000` |
+| `CRAWL_MEMBER_FORM_PATH` | 기본 `/admin/member/member_form.html` |
+| `CRAWL_MEMBER_FORM_EXTRA_QUERY` | 목록과 맞춘 쿼리 스트링 |
+| `SUPABASE_SERVICE_ROLE_KEY` | RPC `insert_members_crawled_batch` 호출용 (또는 `ETK_SERVICE_ROLE_KEY`) |
 
-| Secret 이름 | 필수 여부 |
-|-------------|-----------|
-| `BASE_URL` | 필수 |
-| `LOGIN_PATH` | 필수 |
-| `LIST_OK_PATH` | 필수 |
-| `ADMIN_USER` | 필수 |
-| `ADMIN_PASSWORD` | 필수 |
-| `SUPABASE_URL` | 필수 |
-| `SUPABASE_SERVICE_ROLE_KEY` | 필수 |
-| `LOGIN_USER_FIELD` | 선택 (비우면 코드 기본값) |
-| `LOGIN_PASS_FIELD` | 선택 |
-| `LOGIN_EXTRA_FIELDS_JSON` | 선택 |
-| `LIST_HTTP_METHOD` | 선택 |
-| `LIST_POST_BODY_JSON` | 선택 |
-| `TABLE_SELECTOR` | 선택 |
-| `ROW_ID_HEADER` | 선택 |
-| `VERIFY_TLS` | 선택 |
-| `SUPABASE_TABLE` | 선택 (`crawl_rows` 모드) |
-| `SKIP_SUPABASE` | 선택 |
-| `FETCH_MEMBER_MEMO` | 선택 |
-| `MEMBER_FORM_PATH` | 선택 |
-| `MEMBER_FORM_EXTRA_QUERY` | 선택 |
-| `MEMO_REQUEST_DELAY_MS` | 선택 |
-| `SAVE_TO_MEMBERS_CRAWLED` | 회원 풀패스 시 `true` |
-| `MAX_LIST_PAGES` | 선택 |
+호출 인증: 요청의 `Authorization: Bearer` 값이 **해당 프로젝트의 `SUPABASE_ANON_KEY`** 와 같아야 통과합니다(생일 Edge와 같은 방식).
 
-선택 항목을 만들지 않았다면 GitHub에서는 빈 값으로 넘어가며, 로컬과 동일하게 기본값이 적용됩니다.
+배포 예: `supabase functions deploy member-crawl --no-verify-jwt`
 
-### 4.2 Supabase Edge Function → GitHub 실행 (선택)
-
-저장소에 `supabase/functions/trigger-github-crawl/index.ts` 가 있습니다. GitHub PAT로 `workflow_dispatch`를 호출해 같은 워크플로를 돌립니다.
-
-1. [Supabase CLI](https://supabase.com/docs/guides/cli)로 로그인 후 프로젝트 링크  
-2. Secrets: `GITHUB_TOKEN`(또는 `ETK_GITHUB_TOKEN`), `GITHUB_REPO`(또는 `ETK_GITHUB_REPO`), `GITHUB_WORKFLOW`/`ETK_GITHUB_WORKFLOW`(`crawl.yml`), `GITHUB_REF`/`ETK_GITHUB_REF`(`main`), (권장) `TRIGGER_SECRET`/`ETK_TRIGGER_SECRET` — `admin-login` 함수와 동일한 `ETK_*` 폴백 패턴  
-3. 배포 예: `supabase functions deploy trigger-github-crawl`  
-4. 호출 시 `Authorization: Bearer <TRIGGER_SECRET>` 헤더(시크릿을 넣은 경우)  
-5. Supabase **Database Webhook / Cron** 등에서 이 함수 URL을 주기적으로 호출하면, 스케줄은 GitHub 대신 Edge에서 트리거할 수 있습니다. (이중 스케줄은 피하고 **GitHub cron만** 또는 **Edge만** 쓰는 것을 권장합니다.)
+**주의:** Edge 함수는 **실행 시간 제한**이 있습니다. 페이지·메모 요청이 매우 많으면 타임아웃 날 수 있음 → 그때는 `CRAWL_FETCH_MEMO=false` 로 줄이거나, 로컬에서 `python -m crawler.run`(`.env`)로 돌리는 방식을 병행하세요.
 
 ---
 
@@ -224,5 +210,5 @@ schema.sql
 schema_members_crawled.sql
 requirements.txt
 .github/workflows/crawl.yml
-supabase/functions/trigger-github-crawl/
+supabase/functions/member-crawl/
 ```
