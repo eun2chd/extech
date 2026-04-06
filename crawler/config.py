@@ -48,6 +48,9 @@ class Settings:
     memo_request_delay_ms: int
     save_to_members_crawled: bool
     max_list_pages: int
+    crawl_loop_forever: bool
+    loop_sleep_seconds: float
+    member_list_page_delay_seconds: float
 
 
 def load_settings() -> Settings:
@@ -110,6 +113,23 @@ def load_settings() -> Settings:
     except ValueError as e:
         raise RuntimeError("MAX_LIST_PAGES must be an integer") from e
 
+    crawl_loop_forever = (
+        _get("CRAWL_LOOP_FOREVER", "false") or "false"
+    ).lower() in ("1", "true", "yes")
+    loop_sleep_raw = _get("LOOP_SLEEP_SECONDS", "10") or "10"
+    try:
+        loop_sleep_seconds = max(0.0, float(loop_sleep_raw))
+    except ValueError as e:
+        raise RuntimeError("LOOP_SLEEP_SECONDS must be a number") from e
+
+    mlp_delay_raw = _get("MEMBER_LIST_PAGE_DELAY_SECONDS", "0") or "0"
+    try:
+        member_list_page_delay_seconds = max(0.0, float(mlp_delay_raw))
+    except ValueError as e:
+        raise RuntimeError(
+            "MEMBER_LIST_PAGE_DELAY_SECONDS must be a number",
+        ) from e
+
     return Settings(
         base_url=_require("BASE_URL").rstrip("/"),
         login_path=_require("LOGIN_PATH"),
@@ -139,4 +159,7 @@ def load_settings() -> Settings:
         memo_request_delay_ms=memo_request_delay_ms,
         save_to_members_crawled=save_to_members_crawled,
         max_list_pages=max_list_pages,
+        crawl_loop_forever=crawl_loop_forever,
+        loop_sleep_seconds=loop_sleep_seconds,
+        member_list_page_delay_seconds=member_list_page_delay_seconds,
     )

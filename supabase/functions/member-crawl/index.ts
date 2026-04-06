@@ -1,7 +1,7 @@
 // Setup type definitions for built-in Supabase Runtime APIs
 // @deno-types="https://esm.sh/@supabase/functions-js/src/edge-runtime.d.ts"
 /**
- * 회원 목록 풀 크롤 → members_crawled RPC (seq 중복 skip)
+ * 회원 목록 풀 크롤 → members_crawled RPC (seq 기준 upsert, created_at 유지)
  *
  * GitHub Actions 는 Anon 키로 POST 만 호출하면 됨.
  * 나머지 비밀·URL 은 Supabase Edge Function Secrets 에만 둠.
@@ -194,6 +194,17 @@ async function applySetCookie(res: Response, jar: Map<string, string>) {
 function cookieHeader(jar: Map<string, string>): string {
   return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
 }
+
+function logMemberRpcBatchResult(payloadCount: number, affected: number) {
+  if (payloadCount <= 0) return;
+  console.log(
+    `[member-crawl] RPC 영향 행 수≈${affected} (이 페이지 페이로드 ${payloadCount}건, seq upsert)`,
+  );
+}
+
+const MSG_MEMBER_WRAP_TO_PAGE1 =
+  "[member-crawl] 끝 페이지에 도달했습니다. checkpoint를 1페이지로 되돌렸습니다. " +
+  "다음 호출부터 처음부터 다시 순회합니다.";
 
 /** 디버그: 객체의 모든 키·값 로그 (민감값은 마스크) */
 function logKeyValues(
@@ -643,6 +654,7 @@ Deno.serve(async (req: Request) => {
 
       if (!rows.length) {
         console.log("empty page", page, "checkpoint → next_page=1");
+        console.log(MSG_MEMBER_WRAP_TO_PAGE1);
         try {
           await patchProgressNextPage(supabaseUrl, serviceKey, 1);
         } catch (e) {
@@ -748,7 +760,10 @@ Deno.serve(async (req: Request) => {
           parsedCount: n,
           bodyPreview: rpcText.slice(0, 200),
         });
-        if (typeof n === "number" && !Number.isNaN(n)) totalInserted += n;
+        if (typeof n === "number" && !Number.isNaN(n)) {
+          totalInserted += n;
+          logMemberRpcBatchResult(payloads.length, n);
+        }
       } else if (rows.length) {
         console.warn(
           "[member-crawl] no valid payloads but table had rows; advancing page",
@@ -785,6 +800,7 @@ Deno.serve(async (req: Request) => {
         else {
           console.log("[member-crawl] CRAWL_MAX_LIST_PAGES 도달, checkpoint → 1", page);
         }
+        console.log(MSG_MEMBER_WRAP_TO_PAGE1);
         crawlDone = true;
         break;
       }
@@ -806,7 +822,11 @@ Deno.serve(async (req: Request) => {
         inserted_approx: totalInserted,
         pages_per_run: pagesPerRun,
         message:
-          "호출마다 pages_per_run 만큼만 목록을 처리하고 member_crawl_progress.next_page 에 이어서 할 페이지를 저장함. inserted_approx 는 RPC 신규 행 수 합.",
+          "호출마다 pages_per_run 만큼만 목록을 처리하고 member_crawl_progress.next_page 에 이어서 할 페이지를 저장함. inserted_approx 는 RPC 영향 행 수 합(삽입+갱신).",
+        cycled_to_first_page: crawlDone,
+        message_ko: crawlDone
+          ? "끝(빈 목록·번호=1·상한) 도달 시 checkpoint=1 로 돌아가 다음 호출은 1페이지부터 다시 순회합니다."
+          : "진행 중: 다음 호출은 member_crawl_progress.next_page 이어서 처리합니다.",
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );

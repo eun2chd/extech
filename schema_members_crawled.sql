@@ -1,5 +1,5 @@
--- members_crawled + batch insert (seq 중복 시 건너뜀)
--- Supabase SQL Editor에서 실행
+-- members_crawled + 배치 upsert (seq 충돌 시 열 갱신, created_at 은 최초 유지)
+-- Supabase SQL Editor에서 실행 (함수만 바꿀 때도 이 블록 통째로 실행)
 
 create table if not exists public.members_crawled (
   id bigserial primary key,
@@ -32,6 +32,7 @@ returns integer
 language plpgsql
 security invoker
 set search_path = public
+set timezone = 'Asia/Seoul'
 as $$
 declare
   n int := 0;
@@ -54,7 +55,16 @@ begin
     nullif(r->>'status', ''),
     nullif(r->>'memo', '')
   from jsonb_array_elements(p_rows) as r
-  on conflict (seq) do nothing;
+  on conflict (seq) do update set
+    num = excluded.num,
+    login_id = excluded.login_id,
+    social_type = excluded.social_type,
+    name = excluded.name,
+    phone = excluded.phone,
+    email = excluded.email,
+    join_date = excluded.join_date,
+    status = excluded.status,
+    memo = excluded.memo;
 
   get diagnostics n = row_count;
   return n;
@@ -77,3 +87,5 @@ values ('member_list', 1)
 on conflict (id) do nothing;
 
 grant select, insert, update on public.member_crawl_progress to service_role;
+
+alter role service_role set timezone to 'Asia/Seoul';

@@ -12,3 +12,5 @@ create index if not exists crawl_rows_scraped_at_idx on public.crawl_rows (scrap
 -- Optional: enable RLS so only the service role (used by this crawler) can access data.
 -- The service role key bypasses RLS when inserting from GitHub Actions.
 alter table public.crawl_rows enable row level security;
+
+alter role service_role set timezone to 'Asia/Seoul';

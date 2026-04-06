@@ -1,7 +1,7 @@
 // Setup type definitions for built-in Supabase Runtime APIs
 // @deno-types="https://esm.sh/@supabase/functions-js/src/edge-runtime.d.ts"
 /**
- * 교육 목록(edu_list) → edu upsert / 신청자 목록(edu_apply) → edu_applicant upsert
+ * 교육 목록(edu_list) → legacy_edu upsert(셀 그대로 + 교육명에서 unit 만 괄호 추출) / 신청자 → legacy_edu_applicant
  * 호출마다 N페이지만 처리, 진행은 edu_list_crawl_progress / edu_applicant_crawl_progress 에 저장
  *
  * Secrets: member-crawl 과 동일하게 로그인용 CRAWL_* + SUPABASE_* + 아래 EDU_* 권장
@@ -33,9 +33,13 @@ const corsHeaders: Record<string, string> = {
 const EDU_LIST_PROGRESS_ID = "edu_list";
 const APPLICANT_PROGRESS_ID = "default";
 
-/** ex-tech — 시크릿 EDU_LIST_PATH 없을 때 */
+const MSG_EDU_LIST_WRAP =
+  "[edu-crawl] 교육 목록: 끝(빈 페이지·번호=1·상한) 도달 — checkpoint 1페이지로 복귀. " +
+  "다음 호출부터 처음부터 다시 순회합니다.";
+
+/** ex-tech — 시크릿 EDU_LIST_PATH 없을 때 (필터 파라미터 브라우저와 동일) */
 const DEFAULT_EDU_LIST_PATH =
-  "/admin/edu/edu_list.html?select_key=&input_key=&search=&page=1";
+  "/admin/edu/edu_list.html?select_key=&input_key=&search=&cate=&el_state=-1&el_area=&el_code=&el_startdate=&el_enddate=&page=1";
 
 /** el_seq = 교육 seq(DB·edu_list 체크박스 value). {page} 없으면 URL 에 page 안 붙음 */
 const DEFAULT_EDU_APPLY_TEMPLATE =
@@ -85,6 +89,61 @@ function cellText($: ReturnType<typeof load>, el: unknown): string {
   return $(el as never).text().replace(/\s+/g, " ").trim();
 }
 
+/**
+ * ex-tech edu_list 행: edu_apply_list.html?el_seq= 와 동일한 값이어야 하므로
+ * 행 HTML 의 el_seq= 를 체크박스 value 보다 우선. 없으면 체크박스 → 링크 seq= 다수일 때 최빈값.
+ */
+function extractEduListRowSeq($: ReturnType<typeof load>, tr: unknown): string | null {
+  const $tr = $(tr as never);
+  const html = $tr.html() ?? "";
+  const el = html.match(/(?:[?&])el_seq=(\d+)/i);
+  if (el) return el[1]!;
+
+  const cb = $tr
+    .find(
+      'input[type="checkbox"][name="seq_list[]"], input[type="checkbox"][name^="seq_list"]',
+    )
+    .first()
+    .attr("value")
+    ?.trim();
+  if (cb && /^\d+$/.test(cb)) return cb;
+
+  const seqMatches = [...html.matchAll(/[?&]seq=(\d+)/gi)].map((m) => m[1]!);
+  if (seqMatches.length) {
+    const tally = new Map<string, number>();
+    for (const s of seqMatches) tally.set(s, (tally.get(s) ?? 0) + 1);
+    let best = seqMatches[0]!;
+    let n = 0;
+    for (const [s, c] of tally) {
+      if (c > n) {
+        n = c;
+        best = s;
+      }
+    }
+    return best;
+  }
+  return null;
+}
+
+/**
+ * 헤더 행에 체크박스 열이 없고, 데이터 행만 <td><checkbox></td> 로 시작하면 1칸 밀림.
+ * 이 경우 첫 셀은 헤더 매핑에서 제외한다.
+ */
+function eduListDataCellOffset(
+  $: ReturnType<typeof load>,
+  tr: unknown,
+  headerLen: number,
+): number {
+  const $tr = $(tr as never);
+  const cells = $tr.find("td, th");
+  const n = cells.length;
+  if (n <= headerLen) return 0;
+  const $first = cells.first();
+  const hasCb = $first.find('input[type="checkbox"]').length > 0;
+  if (hasCb && n === headerLen + 1) return 1;
+  return 0;
+}
+
 function parseTable(html: string, selector: string): Record<string, string>[] {
   const $ = load(html);
   let table = $(selector).first();
@@ -107,25 +166,25 @@ function parseTable(html: string, selector: string): Record<string, string>[] {
   console.log("[edu-crawl] parseTable headers (index:key):");
   headers.forEach((h, idx) => console.log(`[edu-crawl]   [${idx}] ${h}`));
 
-  const out: Record<string, string>[] = [];
   const dataRows = rows.toArray().slice(1);
+  const firstDataEl = dataRows[0];
+  const cellOffset = firstDataEl != null
+    ? eduListDataCellOffset($, firstDataEl, headers.length)
+    : 0;
+  console.log("[edu-crawl] parseTable data cell offset (checkbox column pad):", cellOffset);
+
+  const out: Record<string, string>[] = [];
   for (const tr of dataRows) {
     const $tr = $(tr);
     const cells = $tr.find("td, th");
     if (!cells.length) continue;
     const row: Record<string, string> = {};
-    let cb = $tr.find(
-      'input[type="checkbox"][name*="seq_list"], input[type="checkbox"][name*="el_seq"], input[type="checkbox"][name*="seq"]',
-    ).first();
-    if (!cb.length) {
-      cb = $tr.find('input[type="checkbox"]').not("#selectall").not(
-        '[id="selectall"]',
-      ).first();
-    }
-    const v = cb.attr("value");
-    if (v) row._seq = v.trim();
+    const seqVal = extractEduListRowSeq($, tr);
+    if (seqVal) row._seq = seqVal;
     cells.each((i, c) => {
-      const key = headers[i] ?? `col_${i}`;
+      if (i < cellOffset) return;
+      const hi = i - cellOffset;
+      const key = headers[hi] ?? `col_${i}`;
       row[key] = cellText($, c);
     });
     if (Object.values(row).some((x) => x)) out.push(row);
@@ -157,118 +216,58 @@ function stripNbsp(s: string): string {
     .trim();
 }
 
-/** "0/10" → current / capacity */
-function parseCapacitySlash(raw: string): {
-  current: string | null;
-  capacity: string | null;
-} {
+/** 교육명 선두 `(IECEx 010)` → `IECEx 010`(괄호 제외). title 은 셀 원문과 별도 */
+function extractLeadingParenUnit(raw: string): string | null {
   const s = stripNbsp(raw);
-  const m = s.match(/^(\d+)\s*\/\s*(\d+)$/);
-  if (m) return { current: m[1]!, capacity: m[2]! };
-  return { current: null, capacity: s || null };
+  if (!s) return null;
+  const m = s.match(/^\s*\(([^)]*)\)\s*/);
+  if (!m) return null;
+  const inner = stripNbsp(m[1] ?? "");
+  return inner || null;
 }
 
-/** "2026-06-06 ~ 2026-06-07 09:00~17:00" (ex-tech 교육기간) */
-function parseEduPeriodCombined(raw: string): {
-  edu_start_date: string | null;
-  edu_end_date: string | null;
-  edu_time: string | null;
-} {
-  const s = stripNbsp(raw);
-  if (!s) return { edu_start_date: null, edu_end_date: null, edu_time: null };
-  const idx = s.indexOf(" ~ ");
-  if (idx === -1) {
-    const d = s.match(/^(\d{4}-\d{2}-\d{2})/);
-    return {
-      edu_start_date: d ? d[1]! : null,
-      edu_end_date: null,
-      edu_time: null,
-    };
-  }
-  const start = s.slice(0, idx).trim();
-  const tail = s.slice(idx + 3).trim();
-  const m = tail.match(/^(\d{4}-\d{2}-\d{2})\s+(.+)$/);
-  if (m) {
-    return {
-      edu_start_date: start,
-      edu_end_date: m[1]!,
-      edu_time: stripNbsp(m[2]!),
-    };
-  }
-  if (/^\d{4}-\d{2}-\d{2}$/.test(tail)) {
-    return { edu_start_date: start, edu_end_date: tail, edu_time: null };
-  }
-  return { edu_start_date: start, edu_end_date: null, edu_time: tail };
-}
-
-/** "2026-02-09 ~ 2026-05-28" (접수기간) */
-function parseApplyPeriodCombined(raw: string): {
-  start: string | null;
-  end: string | null;
-} {
-  const s = stripNbsp(raw);
-  const idx = s.indexOf(" ~ ");
-  if (idx === -1) return { start: s || null, end: null };
-  return {
-    start: s.slice(0, idx).trim(),
-    end: s.slice(idx + 3).trim(),
-  };
-}
-
+/** 목록 테이블 행 → legacy_edu upsert JSON (셀 문자열 그대로, seq·unit 만 특수) */
 function rowToEduPayload(
   row: Record<string, string>,
 ): Record<string, unknown> | null {
-  const seqRaw = row._seq || pick(row, ["seq", "SEQ", "교육번호"]);
-  if (!seqRaw) return null;
-  const seq = parseInt(String(seqRaw).trim(), 10);
+  const seqRaw = row._seq?.trim();
+  if (!seqRaw || !/^\d+$/.test(seqRaw)) return null;
+  const seq = parseInt(seqRaw, 10);
   if (Number.isNaN(seq)) return null;
+
+  const t = (keys: string[]): string | null => {
+    const v = stripNbsp(pick(row, keys));
+    return v || null;
+  };
 
   const titleRaw = pick(row, ["교육명", "제목", "강좌명", "title"]);
   const title = stripNbsp(titleRaw);
-
-  const period = pick(row, ["교육기간", "교육_기간"]);
-  const ep = period ? parseEduPeriodCombined(period) : {
-    edu_start_date: null,
-    edu_end_date: null,
-    edu_time: null,
-  };
-
-  const applyPeriodRaw = pick(row, ["접수기간", "접수_기간"]);
-  const ap = applyPeriodRaw
-    ? parseApplyPeriodCombined(applyPeriodRaw)
-    : { start: null, end: null };
-
-  const capRaw = pick(row, ["정원", "모집인원", "capacity"]);
-  const cap = capRaw ? parseCapacitySlash(capRaw) : { current: null, capacity: null };
+  const unit = extractLeadingParenUnit(titleRaw);
 
   return {
     seq,
+    display_no: t(["번호", "No", "no"]),
+    region: t(["지역", "region"]),
     title: title || "[제목없음]",
-    region: pick(row, ["지역", "region"]) || null,
-    edu_start_date: ep.edu_start_date ||
-      pick(row, ["교육시작일", "시작일", "edu_start_date"]) || null,
-    edu_end_date: ep.edu_end_date ||
-      pick(row, ["교육종료일", "종료일", "edu_end_date"]) || null,
-    edu_time: ep.edu_time || pick(row, ["교육시간", "시간", "edu_time"]) || null,
-    apply_start_date: ap.start ||
-      pick(row, ["접수시작일", "신청시작일", "apply_start_date"]) || null,
-    apply_end_date: ap.end ||
-      pick(row, ["접수종료일", "신청종료일", "apply_end_date"]) || null,
-    capacity: cap.capacity,
-    current_count: cap.current,
-    category: pick(row, ["분류", "카테고리", "category"]) || null,
-    created_at: pick(row, ["등록일자", "등록일", "created_at"]) || null,
-    updated_at: pick(row, ["수정일", "updated_at"]) || null,
+    unit,
+    edu_period: t(["교육기간일시", "교육기간", "교육_기간"]),
+    apply_period: t(["접수기간", "접수_기간"]),
+    capacity: t(["정원", "모집인원", "capacity"]),
+    category: t(["분류", "카테고리", "category"]),
+    registered_at: t(["등록일자", "등록일", "created_at"]),
   };
 }
 
 function rowToApplicantPayload(
   row: Record<string, string>,
 ): Record<string, unknown> | null {
+  // <th>ID(이력서보기)</th> → normalizeKey → ID이력서보기
   const user_id = stripNbsp(
     pick(row, [
       "ID이력서보기",
       "ID_이력서보기",
+      "ID__이력서보기",
+      "ID이력서",
       "아이디",
       "회원아이디",
       "user_id",
@@ -298,6 +297,19 @@ function rowToApplicantPayload(
     created_at: pick(row, ["등록일자", "신청일", "등록일", "created_at"]) || null,
     updated_at: pick(row, ["수정일", "updated_at"]) || null,
   };
+}
+
+/** 한 RPC 배치에 동일 user_id 가 두 번 있으면 Postgres 21000 */
+function dedupeApplicantPayloads(
+  payloads: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  const m = new Map<string, Record<string, unknown>>();
+  for (const p of payloads) {
+    const uid = stripNbsp(String(p.user_id ?? ""));
+    if (!uid) continue;
+    m.set(uid, p);
+  }
+  return [...m.values()];
 }
 
 async function applySetCookie(res: Response, jar: Map<string, string>) {
@@ -512,7 +524,7 @@ async function fetchMinEduSeq(
   serviceKey: string,
 ): Promise<number | null> {
   const base = supabaseUrl.replace(/\/$/, "");
-  const url = `${base}/rest/v1/edu?select=seq&order=seq.asc&limit=1`;
+  const url = `${base}/rest/v1/legacy_edu?select=seq&order=seq.asc&limit=1`;
   const arr = await restJson(url, serviceKey) as { seq?: number }[];
   if (!Array.isArray(arr) || arr.length === 0) return null;
   const s = arr[0]!.seq;
@@ -526,7 +538,7 @@ async function fetchNextEduSeqAfter(
 ): Promise<number | null> {
   const base = supabaseUrl.replace(/\/$/, "");
   const url =
-    `${base}/rest/v1/edu?select=seq&seq=gt.${afterSeq}&order=seq.asc&limit=1`;
+    `${base}/rest/v1/legacy_edu?select=seq&seq=gt.${afterSeq}&order=seq.asc&limit=1`;
   const arr = await restJson(url, serviceKey) as { seq?: number }[];
   if (!Array.isArray(arr) || arr.length === 0) return null;
   const s = arr[0]!.seq;
@@ -793,6 +805,7 @@ Deno.serve(async (req: Request) => {
         }
 
         if (!rows.length) {
+          console.log(MSG_EDU_LIST_WRAP);
           await patchEduListNextPage(supabaseUrl, serviceKey, 1);
           crawlDone = true;
           lastPage = page;
@@ -831,7 +844,12 @@ Deno.serve(async (req: Request) => {
               },
             );
           }
-          totalUpserted += parseRpcInt(rpcText);
+          const touched = parseRpcInt(rpcText);
+          totalUpserted += touched;
+          console.log(
+            `[edu-crawl] 교육 목록 페이지 ${page}: RPC 영향 행 수=${touched} ` +
+              "(upsert: 동일 seq 는 갱신 · 회원처럼 insert-only 건너뜀 아님)",
+          );
         }
 
         const last = pageHasNumOne(rows);
@@ -841,6 +859,7 @@ Deno.serve(async (req: Request) => {
         processedPages.push(page);
         lastPage = page;
         if (last || hitCap) {
+          console.log(MSG_EDU_LIST_WRAP);
           crawlDone = true;
           break;
         }
@@ -855,6 +874,10 @@ Deno.serve(async (req: Request) => {
           end_page: lastPage,
           crawl_done: crawlDone,
           rows_upsert_touched: totalUpserted,
+          cycled_to_first_page: crawlDone,
+          message_ko: crawlDone
+            ? "교육 목록 끝 도달 시 next_page=1 로 돌아가 다음 호출은 1페이지부터 다시 순회합니다."
+            : "진행 중: 다음 호출은 edu_list_crawl_progress.next_page 이어서 처리합니다.",
         }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
@@ -880,7 +903,7 @@ Deno.serve(async (req: Request) => {
           JSON.stringify({
             success: true,
             mode: "applicants",
-            message: "edu 테이블에 행이 없어 신청자 크롤을 건너뜀",
+            message: "legacy_edu 테이블에 행이 없어 신청자 크롤을 건너뜀",
             pages_processed: 0,
           }),
           { headers: { ...corsHeaders, "Content-Type": "application/json" } },
@@ -960,6 +983,13 @@ Deno.serve(async (req: Request) => {
         const wrap = nextSeq == null
           ? await fetchMinEduSeq(supabaseUrl, serviceKey)
           : nextSeq;
+        console.log(
+          `[edu-crawl] 신청자: 빈 목록 (교육 seq=${eduSeq}). ` +
+            `다음 target_edu_seq=${wrap ?? "null"}, 1페이지부터.` +
+            (nextSeq == null
+              ? " (끝 seq였으면 최소 seq로 순환)"
+              : ""),
+        );
         await patchApplicantProgress(supabaseUrl, serviceKey, {
           target_edu_seq: wrap,
           next_page: 1,
@@ -975,7 +1005,14 @@ Deno.serve(async (req: Request) => {
         if (p) payloads.push(p);
       }
 
-      if (payloads.length) {
+      const payloadsDeduped = dedupeApplicantPayloads(payloads);
+      if (payloadsDeduped.length < payloads.length) {
+        console.log(
+          `[edu-crawl] 신청자 user_id 중복 제거: ${payloads.length} → ${payloadsDeduped.length} (edu_seq=${eduSeq})`,
+        );
+      }
+
+      if (payloadsDeduped.length) {
         const rpcRes = await fetch(`${rpcBase}/upsert_edu_applicant_batch`, {
           method: "POST",
           headers: {
@@ -985,7 +1022,7 @@ Deno.serve(async (req: Request) => {
           },
           body: JSON.stringify({
             p_edu_seq: eduSeq,
-            p_rows: payloads,
+            p_rows: payloadsDeduped,
           }),
         });
         const rpcText = await rpcRes.text();
@@ -1005,7 +1042,12 @@ Deno.serve(async (req: Request) => {
             },
           );
         }
-        totalUpserted += parseRpcInt(rpcText);
+        const aptTouched = parseRpcInt(rpcText);
+        totalUpserted += aptTouched;
+        console.log(
+          `[edu-crawl] 신청자 교육 seq=${eduSeq} 페이지 ${page}: RPC 영향 행 수=${aptTouched} ` +
+            "(upsert: 동일 신청은 갱신)",
+        );
       }
 
       const last = pageHasNumOne(rows);
@@ -1021,6 +1063,10 @@ Deno.serve(async (req: Request) => {
         const wrap = nextSeq == null
           ? await fetchMinEduSeq(supabaseUrl, serviceKey)
           : nextSeq;
+        console.log(
+          `[edu-crawl] 신청자: 교육 seq=${eduSeq} 구간 완료 → 다음 seq=${wrap ?? "null"}, 1페이지부터.` +
+            (nextSeq == null ? " (순환: 최소 seq)" : ""),
+        );
         await patchApplicantProgress(supabaseUrl, serviceKey, {
           target_edu_seq: wrap,
           next_page: 1,
@@ -1048,6 +1094,10 @@ Deno.serve(async (req: Request) => {
         end_page: lastPage,
         crawl_done: crawlDone,
         rows_upsert_touched: totalUpserted,
+        cycled_to_next_edu: crawlDone,
+        message_ko: crawlDone
+          ? "신청자: 교육 seq 한 덩어리 끝나면 다음 seq·1페이지. 마지막 seq 다음은 최소 seq로 순환합니다."
+          : "진행 중: 다음 호출은 edu_applicant_crawl_progress 기준 이어서.",
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );

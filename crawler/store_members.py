@@ -21,14 +21,23 @@ def insert_members_crawled_batch(client: Client, rows: list[dict[str, Any]]) -> 
             {"p_rows": chunk},
         ).execute()
         n = res.data
+        touched = 0
         if isinstance(n, int):
-            total += n
+            touched = n
+            total += touched
         elif n is None:
             pass
         else:
             try:
-                total += int(n)
+                touched = int(n)
+                total += touched
             except (TypeError, ValueError):
                 log.warning("unexpected RPC return: %r", n)
-    log.info("members_crawled: inserted %d new rows (skipped existing seq)", total)
+        if len(chunk) > 0:
+            log.info(
+                "[members_crawled] RPC 영향 행 수≈%d (이 배치 %d건, insert+update 합계)",
+                touched,
+                len(chunk),
+            )
+    log.info("[members_crawled] 이번 호출 합계: RPC 영향 행 수≈%d", total)
     return total
