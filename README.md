@@ -154,6 +154,8 @@ python -m crawler.probe
 
 호출 인증: **`SERVICE_ROLE`** 이면 `Authorization`·`apikey` 둘 다 같은 키. **`ANON`** 이면 Bearer만 ANON과 일치하면 통과(apikey 있으면 ANON과 동일해야 함).
 
+**401 `Unauthorized` 일 때:** 응답 JSON의 `edge_has_service_role` 을 보면 됨. `false` 이면 **Supabase(프로젝트) Edge Secrets** 에 `SUPABASE_SERVICE_ROLE_KEY` 가 없는 것 — **GitHub Secret 에 넣은 값과 완전히 같은 문자열**을 Edge에도 `supabase secrets set SUPABASE_SERVICE_ROLE_KEY='…'` 로 넣고 함수 재배포. 대시보드에 **JWT(`eyJ…`)** 와 **`sb_…`** 이 둘 다 있으면 **한 종류만 골라** GitHub·Edge·RPC 모두 동일하게 맞출 것.
+
 배포 예: `supabase functions deploy member-crawl --no-verify-jwt`
 
 **주의:** Edge 함수는 **실행 시간 제한**이 있습니다. 페이지·메모 요청이 매우 많으면 타임아웃 날 수 있음 → 그때는 `CRAWL_FETCH_MEMO=false` 로 줄이거나, 로컬에서 `python -m crawler.run`(`.env`)로 돌리는 방식을 병행하세요.

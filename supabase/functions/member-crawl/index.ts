@@ -201,13 +201,18 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const anon =
-      Deno.env.get("SUPABASE_ANON_KEY") || Deno.env.get("ETK_ANON_KEY");
-    const serviceRole =
+    const anon = (
+      Deno.env.get("SUPABASE_ANON_KEY") ||
+      Deno.env.get("ETK_ANON_KEY") ||
+      ""
+    ).trim();
+    const serviceRole = (
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ||
-      Deno.env.get("ETK_SERVICE_ROLE_KEY");
+      Deno.env.get("ETK_SERVICE_ROLE_KEY") ||
+      ""
+    ).trim();
     const auth = req.headers.get("Authorization") ?? "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const token = (auth.startsWith("Bearer ") ? auth.slice(7) : "").trim();
     const apikeyHeader = (req.headers.get("apikey") ?? "").trim();
 
     const okAnon = !!anon && token === anon &&
@@ -220,8 +225,10 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({
           success: false,
           error: "Unauthorized",
+          edge_has_service_role: serviceRole.length > 0,
+          edge_has_anon: anon.length > 0,
           hint:
-            "ANON Bearer 이거나, SERVICE_ROLE 이면 Authorization·apikey 둘 다 동일 키 필요",
+            "SERVICE_ROLE 로 호출 시: (1) Supabase Edge 시크릿에 SUPABASE_SERVICE_ROLE_KEY 가 있어야 하고 (2) 그 값과 GitHub Secret 이 한 글자까지 동일해야 합니다. eyJ…(JWT) 와 sb_… 를 섞어 쓰면 안 됩니다. ANON 만 쓸 땐 Bearer=ANON, apikey 는 비우거나 ANON 과 동일.",
         }),
         {
           status: 401,
