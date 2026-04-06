@@ -124,11 +124,13 @@ python -m crawler.probe
 워크플로: `.github/workflows/crawl.yml`
 
 - **역할:** 5분마다 `curl`로 `member-crawl` Edge Function에 `POST`만 보냅니다. (Python 러너 없음)
-- **Repository Secrets (딱 2개):**
+- **Repository Secrets (2개):**
   | Secret | 설명 |
   |--------|------|
-  | `SUPABASE_ANON_KEY` | 프로젝트 anon 키 (`Authorization: Bearer` 로 전달) |
-  | `SUPABASE_PROJECT_REF` | 프로젝트 ref만 (예: `abcdxyz` — URL의 `https://abcdxyz.supabase.co` 앞부분) |
+  | `SUPABASE_SERVICE_ROLE_KEY` | `curl` 시 **`Authorization: Bearer`** 와 **`apikey:`** 에 **동일 값** (게이트웨이 401 방지). 저장소 비공개·Secrets 보호 필수. |
+  | `SUPABASE_PROJECT_REF` | 프로젝트 ref만 (예: `abcdxyz`) |
+
+  `SUPABASE_ANON_KEY`만 쓰려면 Edge 함수가 ANON Bearer를 허용하므로 가능하지만, Supabase 쪽에서 **`apikey` 헤더 없이 401** 나는 경우가 있어 `apikey: <ANON>` 도 같이 보내는 것을 권장합니다.
 
 ### 4.1 Edge Function `member-crawl` 시크릿
 
@@ -150,7 +152,7 @@ python -m crawler.probe
 | `CRAWL_MEMBER_FORM_EXTRA_QUERY` | 목록과 맞춘 쿼리 스트링 |
 | `SUPABASE_SERVICE_ROLE_KEY` | RPC `insert_members_crawled_batch` 호출용 (또는 `ETK_SERVICE_ROLE_KEY`) |
 
-호출 인증: 요청의 `Authorization: Bearer` 값이 **해당 프로젝트의 `SUPABASE_ANON_KEY`** 와 같아야 통과합니다(생일 Edge와 같은 방식).
+호출 인증: **`SERVICE_ROLE`** 이면 `Authorization`·`apikey` 둘 다 같은 키. **`ANON`** 이면 Bearer만 ANON과 일치하면 통과(apikey 있으면 ANON과 동일해야 함).
 
 배포 예: `supabase functions deploy member-crawl --no-verify-jwt`
 

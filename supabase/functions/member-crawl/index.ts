@@ -17,8 +17,9 @@
  *     CRAWL_MEMBER_FORM_PATH, CRAWL_MEMBER_FORM_EXTRA_QUERY
  *   DB (RPC)
  *     SUPABASE_SERVICE_ROLE_KEY (또는 ETK_SERVICE_ROLE_KEY)
- *   호출 인증 (생일 워크플로와 동일)
- *     요청 Authorization: Bearer <SUPABASE_ANON_KEY> — 플랫폼에서 주입되는 ANON 과 일치해야 함
+ *   호출 인증 (둘 중 하나)
+ *     A) Authorization: Bearer <ANON> (apikey 생략 가능, 넣으면 ANON 과 동일 권장)
+ *     B) 서버 간: Authorization: Bearer <SERVICE_ROLE> + apikey: <SERVICE_ROLE> (둘 다 필수, 게이트웨이 401 방지)
  *
  * 배포: supabase functions deploy member-crawl --no-verify-jwt
  */
@@ -202,11 +203,26 @@ Deno.serve(async (req: Request) => {
 
     const anon =
       Deno.env.get("SUPABASE_ANON_KEY") || Deno.env.get("ETK_ANON_KEY");
+    const serviceRole =
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ||
+      Deno.env.get("ETK_SERVICE_ROLE_KEY");
     const auth = req.headers.get("Authorization") ?? "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    if (!anon || token !== anon) {
+    const apikeyHeader = (req.headers.get("apikey") ?? "").trim();
+
+    const okAnon = !!anon && token === anon &&
+      (!apikeyHeader || apikeyHeader === anon);
+    const okService = !!serviceRole && token === serviceRole &&
+      apikeyHeader === serviceRole;
+
+    if (!okAnon && !okService) {
       return new Response(
-        JSON.stringify({ success: false, error: "Unauthorized" }),
+        JSON.stringify({
+          success: false,
+          error: "Unauthorized",
+          hint:
+            "ANON Bearer 이거나, SERVICE_ROLE 이면 Authorization·apikey 둘 다 동일 키 필요",
+        }),
         {
           status: 401,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
