@@ -1,7 +1,11 @@
 # 레거시 PHP 관리자 크롤러 → Supabase
 
-관리자 계정으로 로그인한 뒤 `*_list_ok.php` 같은 엔드포인트에서 내려주는 **HTML 목록(주로 `<table>`)** 을 읽어, 행 단위로 JSON에 넣어 Supabase에 **upsert** 저장합니다.  
-주기 실행은 GitHub Actions의 `cron`(기본 3분 간격) 또는 수동 실행(`workflow_dispatch`)을 사용합니다.
+관리자 계정으로 로그인한 뒤 `*_list_ok.php` 같은 엔드포인트에서 내려주는 **HTML 목록(주로 `<table>`)** 을 읽어, Supabase에 저장합니다.
+
+- **기본 모드:** `crawl_rows` JSON upsert (`SAVE_TO_MEMBERS_CRAWLED=false`)
+- **회원 풀패스 모드:** `SAVE_TO_MEMBERS_CRAWLED=true` — `page=1,2,…` 로 목록을 순회하다 **`번호` 열이 `1`인 행이 보이는 페이지**에서 멈추고, `members_crawled`에 RPC 배치 삽입(`seq` 유니크 중복은 무시). 다음 실행은 다시 1페이지부터 반복.
+
+주기 실행은 **GitHub Actions** `cron`(기본 5분) 또는 **Supabase Edge Function**으로 GitHub `workflow_dispatch`를 호출하는 방식을 쓸 수 있습니다.
 
 ---
 
@@ -13,21 +17,15 @@
 
 ---
 
-## 1. Supabase 테이블 만들기
+## 1. Supabase 스키마
 
-1. Supabase 대시보드 → **SQL Editor**
-2. 저장소 루트의 `schema.sql` 내용을 붙여 넣고 실행
-
-생성되는 테이블(기본 이름):
-
-| 컬럼 | 설명 |
-|------|------|
-| `external_id` | upsert 기준 키 (행 고유값) |
-| `row_data` | 파싱된 한 행 전체(JSON) |
-| `scraped_at` | 수집 시각 |
+1. 대시보드 → **SQL Editor**
+2. 사용하는 모드에 맞게 실행:
+   - **레거시 JSON 적재:** `schema.sql` → `crawl_rows`
+   - **회원 목록 적재:** `schema_members_crawled.sql` → `members_crawled` + `insert_members_crawled_batch` RPC (`seq` 유니크, 중복 삽입은 무시)
 
 3. **Project Settings → API**에서 `Project URL`, **`service_role` API 키**를 복사해 둡니다.  
-   이 크롤러는 서버/GitHub Actions에서 돌아가므로 **`service_role`** 을 사용하는 것을 전제로 합니다. 키는 외부에 노출하지 마세요.
+   크롤러/GitHub Actions는 **`service_role`** 을 사용하는 것을 전제로 합니다. 키는 외부에 노출하지 마세요.
 
 ---
 
@@ -59,6 +57,8 @@ copy .env.example .env
 python -m crawler.run
 ```
 
+**DB 없이 긁은 데이터만 보기:** `.env`에 `SKIP_SUPABASE=true` 를 넣으면 Supabase에 쓰지 않습니다. 터미널에 JSON이 출력되고, 동시에 **`_debug/last_crawl.json`**에 UTF-8로 저장됩니다(한글은 VS Code 등에서 열면 깨지지 않음). PowerShell에서 한글이 깨지면 터미널 UTF-8 설정 후 실행하거나 JSON 파일만 보면 됩니다. 나중에 저장할 때는 `SKIP_SUPABASE=false`로 바꾸고 `schema.sql`로 테이블을 만든 뒤 실행하면 됩니다.
+
 정상일 때 대략 다음 순서로 동작합니다.
 
 1. `BASE_URL` + `LOGIN_PATH`로 로그인 POST  
@@ -66,6 +66,16 @@ python -m crawler.run
 3. `BASE_URL` + `LIST_OK_PATH`로 목록 요청(GET 또는 POST)  
 4. HTML에서 `<table>` 파싱  
 5. `external_id` 기준으로 Supabase `upsert`
+
+### 2.4 HTML 덤프로 같이 분석 (`probe`)
+
+로그인만 한 뒤 지정 URL의 HTML을 `_debug/probe_last.html`에 저장하고, 터미널에 앞부분 미리보기를 출력합니다. `LIST_OK_PATH`가 아직 없어도 동작합니다.
+
+```bash
+python -m crawler.probe
+```
+
+다른 페이지를 보려면 `.env`에 `PROBE_TARGET_URL`(전체 URL)을 넣거나, 한 번만 환경 변수로 넘깁니다.
 
 ---
 
@@ -77,7 +87,7 @@ python -m crawler.run
 |------|------|
 | `BASE_URL` | 사이트 루트 URL (끝 `/` 없이도 됨, 코드에서 정리) |
 | `LOGIN_PATH` | 로그인 처리 경로 (예: `/admin/login/login_ok.php`) |
-| `LIST_OK_PATH` | 목록 데이터 경로 (예: `/admin/apply/edu_apply_list_ok.php`) |
+| `LIST_OK_PATH` | 목록 **HTML 또는 API** 경로. `?page=1` 같은 쿼리 포함 가능 (예: `/admin/member/member_list.html?...` 또는 `..._list_ok.php`) |
 | `ADMIN_USER` | 관리자 아이디 |
 | `ADMIN_PASSWORD` | 관리자 비밀번호 |
 | `SUPABASE_URL` | Supabase Project URL |
@@ -96,6 +106,13 @@ python -m crawler.run
 | `ROW_ID_HEADER` | (자동 추정) | upsert용 고유값이 되는 **헤더가 정규화된 컬럼명**에 맞춰 지정 가능 |
 | `SUPABASE_TABLE` | `crawl_rows` | 저장 테이블 이름 |
 | `VERIFY_TLS` | `true` | 자체서명 HTTPS 등으로 실패 시 `false` (보안상 가급적 사이트 쪽 정상 인증 권장) |
+| `SKIP_SUPABASE` | `false` | `true`면 DB 없이 JSON만 출력·`_debug/last_crawl.json` 저장 |
+| `FETCH_MEMBER_MEMO` | `false` | `true`면 목록의 `_seq`로 `member_form.html`을 추가 GET, `textarea#m_memo` → 각 행 `sub.메모` |
+| `MEMBER_FORM_PATH` | `/admin/member/member_form.html` | 메모가 있는 회원 수정 폼 경로 |
+| `MEMBER_FORM_EXTRA_QUERY` | (ex-tech 목록과 동일 쿼리 기본값) | `mode=modify&seq=` 뒤에 붙는 쿼리스트링 (`select_key=…` 등) |
+| `MEMO_REQUEST_DELAY_MS` | `0` | 메모 요청 사이 간격(ms). 서버 부담 줄일 때 사용 |
+| `SAVE_TO_MEMBERS_CRAWLED` | `false` | `true`면 위 회원 풀패스 + `members_crawled` RPC 저장 (`SKIP_SUPABASE`는 `false`여야 함) |
+| `MAX_LIST_PAGES` | `2000` | 안전 상한. `번호=1`을 못 만나면 이 페이지 수에서 중단 |
 
 `ROW_ID_HEADER`를 비우면, 컬럼명에 `번호`, `신청번호`, `id` 등이 포함된 칼럼이나 첫 번째 칼럼 값으로 `external_id`를 추정합니다. **고유 번호 컬럼이 명확하면 `ROW_ID_HEADER`를 지정하는 것이 가장 안전합니다.**
 
@@ -105,9 +122,11 @@ python -m crawler.run
 
 워크플로 파일: `.github/workflows/crawl.yml`
 
-- **스케줄:** `*/3 * * * *` (약 3분마다)  
-  GitHub 쪽 부하에 따라 실행이 밀릴 수 있습니다. 엄밀한 3분이 필요하면 외부 스케줄러를 검토하세요.
+- **스케줄:** `*/5 * * * *` (5분마다, 부하 시 지연 가능)
+- **타임아웃:** 90분 (페이지·메모 요청이 많을 수 있음)
 - **수동 실행:** Actions 탭 → `crawl-admin-list` → **Run workflow**
+
+회원 풀패스를 쓰려면 Secrets에 `SAVE_TO_MEMBERS_CRAWLED=true`, `SKIP_SUPABASE=false` 를 넣고, Supabase에 `schema_members_crawled.sql`을 적용한 뒤 실행합니다.
 
 ### 4.1 Repository secrets 등록
 
@@ -130,9 +149,26 @@ python -m crawler.run
 | `TABLE_SELECTOR` | 선택 |
 | `ROW_ID_HEADER` | 선택 |
 | `VERIFY_TLS` | 선택 |
-| `SUPABASE_TABLE` | 선택 |
+| `SUPABASE_TABLE` | 선택 (`crawl_rows` 모드) |
+| `SKIP_SUPABASE` | 선택 |
+| `FETCH_MEMBER_MEMO` | 선택 |
+| `MEMBER_FORM_PATH` | 선택 |
+| `MEMBER_FORM_EXTRA_QUERY` | 선택 |
+| `MEMO_REQUEST_DELAY_MS` | 선택 |
+| `SAVE_TO_MEMBERS_CRAWLED` | 회원 풀패스 시 `true` |
+| `MAX_LIST_PAGES` | 선택 |
 
 선택 항목을 만들지 않았다면 GitHub에서는 빈 값으로 넘어가며, 로컬과 동일하게 기본값이 적용됩니다.
+
+### 4.2 Supabase Edge Function → GitHub 실행 (선택)
+
+저장소에 `supabase/functions/trigger-github-crawl/index.ts` 가 있습니다. GitHub PAT로 `workflow_dispatch`를 호출해 같은 워크플로를 돌립니다.
+
+1. [Supabase CLI](https://supabase.com/docs/guides/cli)로 로그인 후 프로젝트 링크  
+2. Secrets: `GITHUB_TOKEN`(또는 `ETK_GITHUB_TOKEN`), `GITHUB_REPO`(또는 `ETK_GITHUB_REPO`), `GITHUB_WORKFLOW`/`ETK_GITHUB_WORKFLOW`(`crawl.yml`), `GITHUB_REF`/`ETK_GITHUB_REF`(`main`), (권장) `TRIGGER_SECRET`/`ETK_TRIGGER_SECRET` — `admin-login` 함수와 동일한 `ETK_*` 폴백 패턴  
+3. 배포 예: `supabase functions deploy trigger-github-crawl`  
+4. 호출 시 `Authorization: Bearer <TRIGGER_SECRET>` 헤더(시크릿을 넣은 경우)  
+5. Supabase **Database Webhook / Cron** 등에서 이 함수 URL을 주기적으로 호출하면, 스케줄은 GitHub 대신 Edge에서 트리거할 수 있습니다. (이중 스케줄은 피하고 **GitHub cron만** 또는 **Edge만** 쓰는 것을 권장합니다.)
 
 ---
 
@@ -175,13 +211,18 @@ python -m crawler.run
 
 ```
 crawler/
-  config.py       # 환경 변수
-  session.py      # 로그인·목록 HTTP
-  parse_table.py  # HTML 테이블 → dict 목록
-  store.py        # Supabase upsert
-  run.py          # 진입점
+  config.py          # 환경 변수
+  session.py         # 로그인·목록 HTTP
+  list_pager.py      # 목록 URL page 파라미터
+  parse_table.py     # HTML 테이블 → dict
+  members_map.py     # 회원 행 → DB 페이로드
+  member_memo.py     # member_form 메모
+  store.py           # crawl_rows upsert
+  store_members.py   # members_crawled RPC
+  run.py             # 진입점
 schema.sql
+schema_members_crawled.sql
 requirements.txt
 .github/workflows/crawl.yml
+supabase/functions/trigger-github-crawl/
 ```
-# extech

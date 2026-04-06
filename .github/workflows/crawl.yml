@@ -1,0 +1,49 @@
+name: crawl-admin-list
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run-crawler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run crawler
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          LOGIN_PATH: ${{ secrets.LOGIN_PATH }}
+          LIST_OK_PATH: ${{ secrets.LIST_OK_PATH }}
+          ADMIN_USER: ${{ secrets.ADMIN_USER }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          LOGIN_USER_FIELD: ${{ secrets.LOGIN_USER_FIELD }}
+          LOGIN_PASS_FIELD: ${{ secrets.LOGIN_PASS_FIELD }}
+          LOGIN_EXTRA_FIELDS_JSON: ${{ secrets.LOGIN_EXTRA_FIELDS_JSON }}
+          LIST_HTTP_METHOD: ${{ secrets.LIST_HTTP_METHOD }}
+          LIST_POST_BODY_JSON: ${{ secrets.LIST_POST_BODY_JSON }}
+          TABLE_SELECTOR: ${{ secrets.TABLE_SELECTOR }}
+          ROW_ID_HEADER: ${{ secrets.ROW_ID_HEADER }}
+          VERIFY_TLS: ${{ secrets.VERIFY_TLS }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_TABLE: ${{ secrets.SUPABASE_TABLE }}
+          SKIP_SUPABASE: ${{ secrets.SKIP_SUPABASE }}
+          FETCH_MEMBER_MEMO: ${{ secrets.FETCH_MEMBER_MEMO }}
+          MEMBER_FORM_PATH: ${{ secrets.MEMBER_FORM_PATH }}
+          MEMBER_FORM_EXTRA_QUERY: ${{ secrets.MEMBER_FORM_EXTRA_QUERY }}
+          MEMO_REQUEST_DELAY_MS: ${{ secrets.MEMO_REQUEST_DELAY_MS }}
+          SAVE_TO_MEMBERS_CRAWLED: ${{ secrets.SAVE_TO_MEMBERS_CRAWLED }}
+          MAX_LIST_PAGES: ${{ secrets.MAX_LIST_PAGES }}
+        run: python -m crawler.run
