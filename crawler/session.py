@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin
 
 import requests
+from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
 
 if TYPE_CHECKING:
     from crawler.config import Settings
@@ -57,19 +59,37 @@ def fetch_list_html_at_path(
     list_path_with_query: str,
 ) -> str:
     url = resolve_url(settings.base_url, list_path_with_query)
-    if settings.list_method == "POST":
-        log.info("POST list: %s", url)
-        r = session.post(
-            url,
-            data=settings.list_post_body or {},
-            timeout=120,
-        )
-    else:
-        log.info("GET list: %s", url)
-        r = session.get(url, timeout=120)
-    r.raise_for_status()
-    r.encoding = r.apparent_encoding or r.encoding or "utf-8"
-    return r.text
+    max_attempts = 4
+    backoff_s = 2.0
+    attempt = 0
+    while True:
+        try:
+            if settings.list_method == "POST":
+                log.info("POST list: %s", url)
+                r = session.post(
+                    url,
+                    data=settings.list_post_body or {},
+                    timeout=120,
+                )
+            else:
+                log.info("GET list: %s", url)
+                r = session.get(url, timeout=120)
+            r.raise_for_status()
+            r.encoding = r.apparent_encoding or r.encoding or "utf-8"
+            return r.text
+        except (ConnectionError, ChunkedEncodingError, Timeout) as e:
+            attempt += 1
+            if attempt >= max_attempts:
+                raise
+            wait = backoff_s * (2 ** (attempt - 1))
+            log.warning(
+                "list fetch failed (%s/%s), retry in %.1fs: %s",
+                attempt,
+                max_attempts,
+                wait,
+                e,
+            )
+            time.sleep(wait)
 
 
 def fetch_list_html(session: requests.Session, settings: Settings) -> str:

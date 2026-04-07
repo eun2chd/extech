@@ -7,7 +7,8 @@
  * Secrets: member-crawl 과 동일하게 로그인용 CRAWL_* + SUPABASE_* + 아래 EDU_* 권장
  *
  *   EDU_LIST_PATH — 미설정 시 ex-tech 기본: /admin/edu/edu_list.html?select_key=&input_key=&search=&page=1
- *   EDU_APPLY_LIST_TEMPLATE — {el_seq} = edu.seq(목록 체크박스와 동일). {seq} 는 {el_seq} 별칭. {page} 있을 때만 치환
+ *   EDU_APPLY_LIST_TEMPLATE — {el_seq} = edu.seq(목록 체크박스와 동일). {seq} 는 {el_seq} 별칭.
+ *     {page} 가 있으면 치환; 없으면 요청 시 `page` 쿼리를 자동 병합(ex-tech: …&el_seq=32&page=7).
  *     기본: /admin/edu/edu_apply_list.html?el_seq={el_seq}
  *   EDU_TABLE_SELECTOR — 기본 table.list_table
  *   EDU_APPLICANT_TABLE_SELECTOR — 기본 table.list_table
@@ -41,7 +42,7 @@ const MSG_EDU_LIST_WRAP =
 const DEFAULT_EDU_LIST_PATH =
   "/admin/edu/edu_list.html?select_key=&input_key=&search=&cate=&el_state=-1&el_area=&el_code=&el_startdate=&el_enddate=&page=1";
 
-/** el_seq = 교육 seq(DB·edu_list 체크박스 value). {page} 없으면 URL 에 page 안 붙음 */
+/** el_seq = 교육 seq. {page} 없어도 신청자 모드에서 `page` 는 항상 쿼리에 병합 */
 const DEFAULT_EDU_APPLY_TEMPLATE =
   "/admin/edu/edu_apply_list.html?el_seq={el_seq}";
 
@@ -70,13 +71,18 @@ function applyListUrl(
   eduSeq: number,
   page: number,
 ): string {
+  const n = Math.max(1, page);
   let filled = template
     .replaceAll("{el_seq}", String(eduSeq))
     .replaceAll("{seq}", String(eduSeq));
   if (filled.includes("{page}")) {
-    filled = filled.replaceAll("{page}", String(Math.max(1, page)));
+    filled = filled.replaceAll("{page}", String(n));
+    return resolveUrl(base, filled);
   }
-  return resolveUrl(base, filled);
+  const href = resolveUrl(base, filled);
+  const u = new URL(href);
+  u.searchParams.set("page", String(n));
+  return u.href;
 }
 
 function normalizeKey(s: string): string {
@@ -918,8 +924,8 @@ Deno.serve(async (req: Request) => {
 
     apStartPage = Math.max(1, Math.min(apStartPage, maxPages));
 
-    /** 템플릿에 {page} 없으면 ex-tech 처럼 단일 URL — 한 번만 받고 다음 교육으로 */
-    const applyListPaginated = applyTemplate.includes("{page}");
+    /** applyListUrl 이 항상 `page` 쿼리를 붙이므로 신청 목록은 항상 다페이지 가능 */
+    const applyListPaginated = true;
 
     let totalUpserted = 0;
     const processedPages: number[] = [];
@@ -1010,6 +1016,29 @@ Deno.serve(async (req: Request) => {
         console.log(
           `[edu-crawl] 신청자 user_id 중복 제거: ${payloads.length} → ${payloadsDeduped.length} (edu_seq=${eduSeq})`,
         );
+      }
+
+      if (rows.length && !payloadsDeduped.length) {
+        const nextSeq = await fetchNextEduSeqAfter(
+          supabaseUrl,
+          serviceKey,
+          eduSeq!,
+        );
+        const wrap = nextSeq == null
+          ? await fetchMinEduSeq(supabaseUrl, serviceKey)
+          : nextSeq;
+        console.log(
+          `[edu-crawl] 신청자: 표는 ${rows.length}행이나 user_id 0건(파싱 실패·잘못된 테이블). ` +
+            `edu_seq=${eduSeq} page=${page} — 다음 seq=${wrap ?? "null"}로 이동(무한 페이징 방지).`,
+        );
+        await patchApplicantProgress(supabaseUrl, serviceKey, {
+          target_edu_seq: wrap,
+          next_page: 1,
+        });
+        crawlDone = true;
+        lastPage = page;
+        processedPages.push(page);
+        break;
       }
 
       if (payloadsDeduped.length) {

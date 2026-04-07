@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from typing import Any
+from urllib.parse import parse_qsl, urlencode
 
 from supabase import Client
 
@@ -302,7 +303,8 @@ def crawl_applicant_pages_for_edu_seq(
     start_page: int = 1,
 ) -> int:
     """한 교육 seq 에 대해 신청 목록 URL 을 페이지 끝까지(빈 표·번호=1·상한). 반환: RPC 영향 합."""
-    apply_list_paginated = "{page}" in apply_template
+    # apply_list_fetch_path 가 {page} 없을 때도 `page` 쿼리를 병합
+    apply_list_paginated = True
     max_pages = max(1, max_pages)
     total_touched = 0
     page = max(1, start_page)
@@ -331,12 +333,16 @@ def crawl_applicant_pages_for_edu_seq(
 
         if rows and not payloads:
             sample = rows[0]
-            log.warning(
-                "[신청자] seq=%s 표 %d행인데 user_id 0건. 키=%s",
+            log.error(
+                "[신청자] seq=%s p.%s 표 %d행인데 user_id 0건(파싱 실패·잘못된 테이블 가능). "
+                "키=%s — 이 교육 페이징 중단(무한 page 증가 방지). "
+                "EDU_APPLY_LIST_TEMPLATE·EDU_APPLICANT_TABLE_SELECTOR 확인.",
                 edu_seq,
+                page,
                 len(rows),
                 list(sample.keys()),
             )
+            break
 
         if payloads:
             n = upsert_edu_applicant_batch(client, edu_seq, payloads)
@@ -440,9 +446,17 @@ def apply_list_fetch_path(template: str, edu_seq: int, page: int) -> str:
     filled = (
         template.replace("{el_seq}", str(edu_seq)).replace("{seq}", str(edu_seq))
     )
+    p = max(1, page)
     if "{page}" in filled:
-        filled = filled.replace("{page}", str(max(1, page)))
-    return filled.strip()
+        return filled.replace("{page}", str(p)).strip()
+    path_q = filled.split("?", 1)
+    path = path_q[0].strip()
+    if len(path_q) < 2:
+        return f"{path}?page={p}".strip()
+    q = path_q[1]
+    pairs = [(k, v) for k, v in parse_qsl(q, keep_blank_values=True) if k != "page"]
+    pairs.append(("page", str(p)))
+    return f"{path}?{urlencode(pairs)}"
 
 
 def run_applicants_phase(
@@ -463,7 +477,7 @@ def run_applicants_phase(
     ensure_applicant_progress(client)
     pages_per_run = max(1, min(50, pages_per_run))
     max_pages = max(1, max_pages)
-    apply_list_paginated = "{page}" in apply_template
+    apply_list_paginated = True
 
     edu_seq, ap_start_page = get_applicant_progress(client)
     if edu_seq is None:
@@ -528,9 +542,11 @@ def run_applicants_phase(
 
         if rows and not payloads:
             sample = rows[0]
-            log.warning(
-                "[신청자] 표는 %d행인데 user_id 추출에 성공한 행이 0건입니다. "
-                "첫 행 컬럼 키=%s 샘플=%s",
+            log.error(
+                "[신청자] 교육 seq=%s p.%s 표 %d행인데 user_id 0건 — 진행 종료 후 다음 교육으로 "
+                "(파싱/셀렉터·URL 확인). 키=%s 샘플=%s",
+                edu_seq,
+                page,
                 len(rows),
                 list(sample.keys()),
                 {
@@ -539,6 +555,11 @@ def run_applicants_phase(
                     if k != "_seq"
                 },
             )
+            next_seq = fetch_next_edu_seq_after(client, edu_seq)
+            wrap = next_seq if next_seq is not None else fetch_min_edu_seq(client)
+            patch_applicant_progress(client, wrap, 1)
+            last_page = page
+            break
 
         if payloads:
             n = upsert_edu_applicant_batch(client, edu_seq, payloads)
