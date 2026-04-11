@@ -1,95 +1,165 @@
-# 레거시 PHP 관리자 크롤러 → Supabase
+📌 레거시 PHP 관리자 크롤러 → Supabase 정리
+1. 개요
 
-관리자 계정으로 로그인한 뒤 `*_list_ok.php` 같은 엔드포인트에서 내려주는 **HTML 목록(주로 `<table>`)** 을 읽어, Supabase에 저장합니다.
+관리자 로그인 후 *_list_ok.php 또는 HTML 목록 페이지를 크롤링하여 Supabase에 저장한다.
 
-- **기본 모드:** `crawl_rows` JSON upsert (`SAVE_TO_MEMBERS_CRAWLED=false`)
-- **회원 풀패스 모드:** `SAVE_TO_MEMBERS_CRAWLED=true` — `page=1,2,…` 로 목록을 순회하다 **`번호` 열이 `1`인 행이 보이는 페이지**에서 멈추고, `members_crawled`에 RPC 배치 **upsert**(`seq` 기준: 신규 삽입·기존 행은 필드 갱신, `created_at`은 최초 유지). 다음 실행은 다시 1페이지부터 반복.
+기본 흐름
+관리자 로그인
+목록 페이지 요청 (page=1,2,...)
+HTML <table> 파싱
+데이터 가공
+Supabase upsert
 
-**운영 스케줄(권장):** GitHub Actions는 **`SUPABASE_ANON_KEY` + `SUPABASE_PROJECT_REF` 두 개만** Secrets에 두고, `member-crawl` **Edge Function**에 관리자·크롤 URL·`service_role` 등을 넣습니다. (생일 지급 워크플로와 같은 패턴.)
+2. 동작 모드
+2.1 기본 모드
+테이블: crawl_rows
+방식: JSON upsert
+설정:
+SAVE_TO_MEMBERS_CRAWLED=false
+2.2 회원 풀패스 모드
+테이블: members_crawled
+방식: RPC batch upsert (seq 기준)
+특징:
+page=1부터 순회
+번호 = 1 나오면 종료
+다음 실행 시 다시 1부터 시작
+SAVE_TO_MEMBERS_CRAWLED=true
+2.3 교육 크롤 모드
+대상 테이블
+legacy_edu (교육)
+legacy_edu_applicant (신청자)
+관계
+교육 (1) : 신청자 (N)
+처리 흐름
+교육 목록 수집
+각 교육(seq)별 신청자 수집
+3. Supabase 스키마
+3.1 회원
+members_crawled
+insert_members_crawled_batch
+3.2 교육
+legacy_edu
+3.2b 교육신청관리(관리자 전체 신청)
+edu_apply, edu_apply_user — schema_edu_apply.sql, 실행: python -m crawler.edu_apply_management_crawl
+3.3 신청자
+legacy_edu_applicant
+3.4 진행 상태 테이블
+테이블	역할
+member_crawl_progress	회원 다음 page
+edu_list_crawl_progress	교육 목록 page
+edu_applicant_crawl_progress	신청자 진행
 
----
+## 파이썬 실행 명령 모음
 
-## 사전 준비
+프로젝트 루트에서 `.env` 를 채운 뒤 아래 명령을 실행한다.
 
-- **Python** 3.10 이상 권장 (GitHub Actions 워크플로는 3.12 사용)
-- **Supabase** 프로젝트
-- 대상 사이트의 **관리자 로그인 URL**, **목록 데이터 URL**(`list_ok` 등), 로그인 폼 **필드 이름**
+### 명령 한눈에
 
----
+| 명령 | 하는 일 |
+|------|---------|
+| `python -m crawler.run` | **기본 크롤**: `LIST_OK_PATH` 를 **한 번** 받아 표를 파싱한 뒤 `crawl_rows` 에 upsert. `SKIP_SUPABASE=true` 이면 DB 없이 JSON 출력·`_debug/last_crawl.json` 저장. **`SAVE_TO_MEMBERS_CRAWLED=true`** 이면 회원 목록을 `page=1`부터 끝(번호=1)까지 순회하며 `members_crawled` RPC 배치 저장·메모 보강·무한 라운드 옵션 지원. |
+| `python -m crawler.edu_crawl_local` | **교육(강좌) + 신청자**: 교육 목록 페이지를 순회해 `legacy_edu` (`upsert_edu_batch` RPC), 이어서 **교육 seq별** 신청자 목록(`/admin/edu/edu_apply_list.html?el_seq=…`)을 긁어 `legacy_edu_applicant` (`upsert_edu_applicant_batch` RPC) 저장. |
+| `python -m crawler.edu_apply_management_crawl` | **교육신청관리(전체)**: `/admin/edu/edu_apply_list.html` 목록과 각 행의 `edu_apply_form.html?mode=modify&seq=…` 상세(개인·회사 필드만)를 읽어 **`edu_apply` / `edu_apply_user`** (1:1) upsert. 스키마는 `schema_edu_apply.sql`. |
+| `python -m crawler.probe` | **HTML 디버그**: 로그인 후 `PROBE_TARGET_URL`(또는 기본 회원 목록) 한 번 GET 해서 `probe_last.html` 등으로 저장. Supabase 미사용. |
+| `python -m crawler.edu_list_debug` | **교육 목록 파싱 디버그**: `EDU_LIST_PATH` 한 페이지를 파싱한 헤더·행·seq 추출 결과를 **표준출력 JSON** 으로 출력. DB 미저장. |
 
-## 1. Supabase 스키마
+### 옵션·환경 요약
 
-1. 대시보드 → **SQL Editor**
-2. 사용하는 모드에 맞게 실행:
-   - **레거시 JSON 적재:** `schema.sql` → `crawl_rows`
-   - **회원 목록 적재:** `schema_members_crawled.sql` → `members_crawled` + `insert_members_crawled_batch` RPC (`seq` 유니크, **충돌 시 업데이트**) + **`member_crawl_progress`** (Edge가 다음에 읽을 목록 `page` 저장)
-   - **교육·신청자 (Edge `edu-crawl`):** 순서대로 **`schema_edu.sql`** (교육 `legacy_edu` 1 : N 신청 `legacy_edu_applicant`) → **`schema_edu_crawl.sql`** (진행 테이블 + RPC; 파일 상단에서 기존 `upsert_edu_*` 함수 DROP 후 재생성). 선택: **`schema_edu_views.sql`** — 조회용 뷰 `edu`, `edu_applicants`(`edu_seq` 포함). 테이블이 없으면 **`schema_edu.sql` 미실행** 상태입니다.
+| 모듈 | 자주 쓰는 플래그 / 변수 |
+|------|-------------------------|
+| `crawler.run` | `SAVE_TO_MEMBERS_CRAWLED`, `SKIP_SUPABASE`, `LIST_OK_PATH`, `TABLE_SELECTOR`, `MAX_LIST_PAGES`, `CRAWL_LOOP_FOREVER` |
+| `crawler.edu_crawl_local` | `--skip-applicants` (교육만), `--delay`, `--loop`, `--applicants-progress-mode`, `EDU_LIST_PATH`, `EDU_APPLY_LIST_TEMPLATE` 등 |
+| `crawler.edu_apply_management_crawl` | `--max-pages`, `--start-page`, `--detail-delay`, `--skip-detail`, `EDU_APPLY_MANAGE_LIST_PATH`, `EDU_APPLY_DETAIL_PATH_TEMPLATE` |
+| `crawler.probe` | `PROBE_TARGET_URL` |
+| `crawler.edu_list_debug` | `--page`, `--limit` |
 
-3. **Project Settings → API**에서 URL·키를 복사해 둡니다.  
-   - **Edge `member-crawl`:** 함수 Secrets에 `SUPABASE_SERVICE_ROLE_KEY`(RPC용) 저장. `SUPABASE_URL` / `SUPABASE_ANON_KEY`는 Edge 런타임에 자동 주입되는 경우가 많습니다.  
-   - **로컬 Python:** `.env`에 `service_role` 사용 시 동일하게 취급합니다.
-
----
-
-## 2. 로컬 실행
-
-### 2.1 의존성 설치
-
-프로젝트 루트에서:
-
-```bash
-pip install -r requirements.txt
-```
-
-### 2.2 환경 변수 파일
-
-`.env.example`을 복사해 **`.env`** 파일을 만들고 값을 채웁니다.
-
-```bash
-copy .env.example .env
-```
-
-( macOS / Linux: `cp .env.example .env` )
-
-**`.env`는 Git에 커밋하지 마세요.** (이미 `.gitignore`에 포함)
-
-### 2.3 실행
-
-```bash
+4. 실행 방법
+4.1 기본 실행
 python -m crawler.run
-```
+4.2 교육 크롤
+python -m crawler.edu_crawl_local
+옵션:
+--skip-applicants   # 신청자 제외
+--delay 5           # 요청 간 딜레이
 
-**DB 없이 긁은 데이터만 보기:** `.env`에 `SKIP_SUPABASE=true` 를 넣으면 Supabase에 쓰지 않습니다. 이때 **`SAVE_TO_MEMBERS_CRAWLED`가 꺼져 있으면** `LIST_OK_PATH`를 **한 번만** 요청합니다(보통 URL에 적힌 `page=` 한 페이지). 1페이지부터 끝까지 순회하려면 `SAVE_TO_MEMBERS_CRAWLED=true`, `SKIP_SUPABASE=false`를 켜고 아래 회원 풀패스 설명대로 실행하세요. 터미널에 JSON이 출력되고, 동시에 **`_debug/last_crawl.json`**에 UTF-8로 저장됩니다(한글은 VS Code 등에서 열면 깨지지 않음). PowerShell에서 한글이 깨지면 터미널 UTF-8 설정 후 실행하거나 JSON 파일만 보면 됩니다. 나중에 저장할 때는 `SKIP_SUPABASE=false`로 바꾸고 `schema.sql`로 테이블을 만든 뒤 실행하면 됩니다.
-
-정상일 때 대략 다음 순서로 동작합니다.
-
-1. `BASE_URL` + `LOGIN_PATH`로 로그인 POST  
-2. 세션 쿠키 유지  
-3. `BASE_URL` + `LIST_OK_PATH`로 목록 요청(GET 또는 POST)  
-4. HTML에서 `<table>` 파싱  
-5. `external_id` 기준으로 Supabase `upsert`
-
-### 2.4 HTML 덤프로 같이 분석 (`probe`)
-
-로그인만 한 뒤 지정 URL의 HTML을 `_debug/probe_last.html`에 저장하고, 터미널에 앞부분 미리보기를 출력합니다. `LIST_OK_PATH`가 아직 없어도 동작합니다.
-
-```bash
+4.3 교육신청관리(전체 목록+상세)
+python -m crawler.edu_apply_management_crawl
+4.4 디버그
+HTML 확인
 python -m crawler.probe
-```
-
-다른 페이지를 보려면 `.env`에 `PROBE_TARGET_URL`(전체 URL)을 넣거나, 한 번만 환경 변수로 넘깁니다.
-
-### 2.5 교육 목록 `edu_list` 파싱 확인 (`edu_list_debug`)
-
-Edge `edu-crawl`과 동일한 필터 쿼리로 한 페이지를 받아, 헤더·각 행의 `seq`·`edge_like_payload`를 JSON으로 출력합니다. `LIST_OK_PATH` 없이 `BASE_URL`·로그인만 있으면 됩니다 (ex-tech 는 `LOGIN_USER_FIELD=m_id`, `LOGIN_PASS_FIELD=m_pass`).
-
-```bash
+교육 목록 확인
 python -m crawler.edu_list_debug --page 1
-python -m crawler.edu_list_debug --page 134 --limit 5
-```
+5. 환경 변수
+필수
+변수	설명
+BASE_URL	사이트 URL
+LOGIN_PATH	로그인 경로
+LIST_OK_PATH	목록 URL
+ADMIN_USER	관리자 ID
+ADMIN_PASSWORD	비밀번호
+SUPABASE_URL	Supabase URL
+SUPABASE_SERVICE_ROLE_KEY	service_role 키
+주요 옵션
+변수	기본값	설명
+SAVE_TO_MEMBERS_CRAWLED	false	회원 모드
+SKIP_SUPABASE	false	DB 저장 여부
+TABLE_SELECTOR	table	파싱 대상
+LIST_HTTP_METHOD	GET	요청 방식
+MAX_LIST_PAGES	2000	최대 페이지
+LOOP_SLEEP_SECONDS	10	반복 대기
+6. 크롤링 전략
+6.1 페이지 종료 조건
+번호 == 1 → 마지막 페이지
+6.2 신청자 크롤
+URL
+/admin/edu/edu_apply_list.html?el_seq={seq}
+특징
+{seq} = 교육 PK
+페이지 없으면 1회 요청
+6.3 데이터 저장
+교육
+upsert_edu_batch
+신청자
+upsert_edu_applicant_batch
+7. 운영 (GitHub Actions + Edge)
+구조
+GitHub Actions → Edge Function → Supabase
+Secrets
+이름	설명
+SUPABASE_SERVICE_ROLE_KEY	인증
+SUPABASE_PROJECT_REF	프로젝트 ID
+실행 방식
+3분마다 호출
+1페이지씩 진행
+진행 상태 DB 저장
+8. 성능 / 안정성
+권장 설정
+MEMBER_LIST_PAGE_DELAY_SECONDS=30
+EDU_APPLICANT_PAGE_DELAY_SECONDS=30
+과부하 방지
+요청 간 딜레이 필수
+동시에 여러 프로세스 실행 금지
+9. 주요 문제 & 해결
+문제	원인
+데이터 0건	테이블 selector 오류
+신청자 저장 안됨	edu 먼저 없음
+로그인 실패	필드명 불일치
+401	service_role 키 불일치
+10. 핵심 설계 포인트
+✔ 크롤링
+페이지 단위 처리
+상태 저장 기반 이어서 실행
+✔ DB
+upsert 기반 중복 방지
+seq 기준 식별
+✔ 안정성
+딜레이 필수
+진행 테이블 필수
+🚀 한 줄 요약
 
-선택: `EDU_LIST_PATH`, `TABLE_SELECTOR` (기본 `table.list_table`).
+회원·목록 범용은 `crawler.run`, 강좌+강좌별 신청자는 `edu_crawl_local`, 관리자 **교육신청관리** 화면 동기화는 `edu_apply_management_crawl`, HTML·파싱 확인은 `probe` / `edu_list_debug`.
 
+<<<<<<< HEAD
 ### 2.6 실행 명령 정리 — 무엇을 돌리면 되나요?
 
 | 하고 싶은 일 | 실행 명령 | `.env`에서 특히 켜야 할 것 |
@@ -335,3 +405,5 @@ requirements.txt
 supabase/functions/member-crawl/
 supabase/functions/edu-crawl/
 ```
+=======
+>>>>>>> 626ab94841cf57b61701fef2fbeff65b7fbca73c
