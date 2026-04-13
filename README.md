@@ -41,6 +41,8 @@ insert_members_crawled_batch
 legacy_edu
 3.2b 교육신청관리(관리자 전체 신청)
 edu_apply, edu_apply_user — schema_edu_apply.sql, 실행: python -m crawler.edu_apply_management_crawl
+3.2c 이력서(관리자)
+PostgreSQL — `schema_resume_drop.sql` 후 `schema_resume.sql` 로 `crawl_*` 테이블 생성, `python -m crawler.resume_crawl`. 소스: `resume_list.html` 목록 + `resume_form.html` 상세.
 3.3 신청자
 legacy_edu_applicant
 3.4 진행 상태 테이블
@@ -62,6 +64,7 @@ edu_applicant_crawl_progress	신청자 진행
 | `python -m crawler.edu_apply_management_crawl` | **교육신청관리(전체)**: `/admin/edu/edu_apply_list.html` 목록과 각 행의 `edu_apply_form.html?mode=modify&seq=…` 상세(개인·회사 필드만)를 읽어 **`edu_apply` / `edu_apply_user`** (1:1) upsert. 스키마는 `schema_edu_apply.sql`. |
 | `python -m crawler.probe` | **HTML 디버그**: 로그인 후 `PROBE_TARGET_URL`(또는 기본 회원 목록) 한 번 GET 해서 `probe_last.html` 등으로 저장. Supabase 미사용. |
 | `python -m crawler.edu_list_debug` | **교육 목록 파싱 디버그**: `EDU_LIST_PATH` 한 페이지를 파싱한 헤더·행·seq 추출 결과를 **표준출력 JSON** 으로 출력. DB 미저장. |
+| `python -m crawler.resume_crawl` | **이력서 전체**: `resume_list.html`에서 seq 수집(번호 `1` 행이 있는 페이지까지), 각 `resume_form.html` 상세 파싱 후 **PostgreSQL** (`crawl_resumes` 등 `schema_resume.sql`)에 저장. |
 
 ### 옵션·환경 요약
 
@@ -72,6 +75,31 @@ edu_applicant_crawl_progress	신청자 진행
 | `crawler.edu_apply_management_crawl` | `--max-pages`, `--start-page`, `--detail-delay`, `--skip-detail`, `EDU_APPLY_MANAGE_LIST_PATH`, `EDU_APPLY_DETAIL_PATH_TEMPLATE` |
 | `crawler.probe` | `PROBE_TARGET_URL` |
 | `crawler.edu_list_debug` | `--page`, `--limit` |
+| `crawler.resume_crawl` | `DATABASE_URL`, `RESUME_LIST_PATH`, `RESUME_DETAIL_PATH_TEMPLATE`, `RESUME_LIST_DELAY_SECONDS`, `RESUME_LIST_HTTP_TIMEOUT`, `RESUME_DETAIL_DELAY_SECONDS`, `--dry-run`, `--max-pages`, `--start-page`, `--seq` |
+
+### 이력서 크롤러 (PostgreSQL)
+
+1. 이력서 크롤 테이블은 **`crawl_` 접두사** (`crawl_resumes`, `crawl_resume_details`, …). **초기화:** `schema_resume_drop.sql` 실행 후 `schema_resume.sql` 실행. 이미 `crawl_*`만 있고 컬럼만 맞추면 `schema_resume_migrate.sql`.
+2. `.env`에 관리자 로그인(`BASE_URL`, `LOGIN_PATH`, `ADMIN_USER`, `ADMIN_PASSWORD`, ex-tech이면 `LOGIN_USER_FIELD=m_id`, `LOGIN_PASS_FIELD=m_pass`)과 `DATABASE_URL`(예: `postgresql://user:pass@localhost:5432/dbname`) 설정.
+3. 실행 예:
+
+```bash
+python -m pip install -r requirements.txt
+python -m crawler.resume_crawl --check-db
+python -m crawler.resume_crawl --dry-run --max-pages 1
+python -m crawler.resume_crawl
+python -m crawler.resume_crawl --seq 12345 --seq 12346
+python -m crawler.resume_crawl --start-page 97
+```
+
+- **LIST:** 각 행마다 `crawl_resumes(seq, …)` 부모만 `ON CONFLICT (seq) DO NOTHING` 으로 만든다. **DETAIL:** 같은 `seq`로 상세 HTML을 받아 `resume_id` 기준으로 **`crawl_resumes` 본문 UPDATE + `crawl_resume_*` 자식 재삽입**한다. 외부 키는 `seq`, 내부 PK는 `id`이며 `get_resume_id(conn, seq)` 로 매핑할 수 있다. 목록 `td` 인덱스는 `RESUME_LIST_NAME_TD_INDEX` / `RESUME_LIST_USER_ID_TD_INDEX`(기본 2, 3)로 조정 가능.
+- `--dry-run`: DB 연결 없이 목록 수집 후 **첫 번째 seq** 상세만 JSON으로 stdout 출력.
+- `--start-page N`: 목록을 `page=N`부터 요청 (중단 후 이어하기). `1`~`N-1` 페이지는 이번 실행에서 건너뜀.
+- `--max-pages`: 목록 **절대** `page` 상한. `0`이면 번호 `"1"` 행이 나올 때까지. 예: `--start-page 97 --max-pages 97` 이면 97페이지만 한 번 요청.
+- 목록 `ReadTimeout`: 해당 `page` HTML이 `RESUME_LIST_HTTP_TIMEOUT`(기본 120초) 안에 끝나지 않을 때. 재시도 후에도 실패하면 값을 늘리거나(예: 300), 브라우저로 동일 URL이 열리는지 확인.
+- `--seq`: 목록 생략하고 지정한 seq만 상세·저장.
+
+코드 API: `get_seq_list`, `iter_resume_list_seq_batches`, `parse_resume_list_tr`, `insert_resume_from_list(conn, list_row)`, `get_resume_id(conn, seq)`, `merge_resume_detail(conn, resume_id, data)`, `insert_db(conn, data)`(stub+머지), `get_detail`, `serialize_resume_payload` 등.
 
 4. 실행 방법
 4.1 기본 실행
@@ -89,6 +117,8 @@ HTML 확인
 python -m crawler.probe
 교육 목록 확인
 python -m crawler.edu_list_debug --page 1
+4.5 이력서 (PostgreSQL)
+python -m crawler.resume_crawl
 5. 환경 변수
 필수
 변수	설명
@@ -157,5 +187,5 @@ seq 기준 식별
 진행 테이블 필수
 🚀 한 줄 요약
 
-회원·목록 범용은 `crawler.run`, 강좌+강좌별 신청자는 `edu_crawl_local`, 관리자 **교육신청관리** 화면 동기화는 `edu_apply_management_crawl`, HTML·파싱 확인은 `probe` / `edu_list_debug`.
+회원·목록 범용은 `crawler.run`, 강좌+강좌별 신청자는 `edu_crawl_local`, 관리자 **교육신청관리** 화면 동기화는 `edu_apply_management_crawl`, **이력서**는 `resume_crawl` + `schema_resume_drop.sql` / `schema_resume.sql`, HTML·파싱 확인은 `probe` / `edu_list_debug`.
 
